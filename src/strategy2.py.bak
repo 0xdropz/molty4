@@ -1,0 +1,861 @@
+"""
+strategy.py — Aggressive decision engine with LOCKED TARGET system.
+RANK = KILLS > HP. Once a target is locked, bot focuses exclusively on killing it.
+"""
+
+from src.state_manager import GameState, EnemyInfo
+from src.god_mode import GodModeIntel
+from src.combat import select_target, can_kill_in_one_hit
+from src.survival import (
+    is_critical,
+    needs_healing,
+    get_heal_action,
+    has_heal_option,
+    should_rest,
+    get_rest_action,
+    get_supply_cache,
+    get_energy_drink_action,
+)
+from src.movement import must_flee_death_zone, choose_explore_move, move_toward_target
+from src.config import (
+    MIN_EP_ATTACK,
+    CRITICAL_HP,
+    LOW_HP,
+    MONSTER_PRIORITY,
+    IS_FRIENDLY_REGEX,
+)
+
+
+class TargetLock:
+    """Persistent locked target state across turns."""
+
+    def __init__(self):
+        self.target_id: str = ""
+        self.target_name: str = ""
+        self.last_region_id: str = ""  # last known region
+        self.chase_turns: int = 0  # how many turns we've been chasing
+        self.max_chase_turns: int = 8  # give up after this many turns
+
+    @property
+    def is_locked(self) -> bool:
+        return bool(self.target_id)
+
+    def lock(self, target_id: str, target_name: str, region_id: str = ""):
+        self.target_id = target_id
+        self.target_name = target_name
+        self.last_region_id = region_id
+        self.chase_turns = 0
+
+    def unlock(self):
+        self.target_id = ""
+        self.target_name = ""
+        self.last_region_id = ""
+        self.chase_turns = 0
+
+    def increment_chase(self):
+        self.chase_turns += 1
+
+    def is_chase_expired(self) -> bool:
+        return self.chase_turns >= self.max_chase_turns
+
+
+def _find_target_in_visible(state: GameState, target_id: str) -> EnemyInfo | None:
+    """Find a specific target in visible enemies."""
+    for e in state.visible_enemies:
+        if e.id == target_id:
+            return e
+    return None
+
+
+def _find_target_in_godmode(intel: GodModeIntel, target_id: str) -> dict | None:
+    """Find target position via god mode."""
+    if not intel or not intel.available:
+        return None
+    for agent in intel.all_agents:
+        if agent.get("id") == target_id:
+            if agent.get("isAlive", False):
+                return {
+                    "id": agent["id"],
+                    "name": agent.get("name", ""),
+                    "hp": agent.get("hp", 0),
+                    "region_id": agent.get("regionId", ""),
+                    "region_name": intel.get_region_name(agent.get("regionId", "")),
+                }
+    return None
+
+
+def _is_in_attack_range(
+    target_region: str,
+    my_region: str,
+    weapon_range: int,
+    state: GameState,
+    intel: GodModeIntel = None,
+) -> bool:
+    """Check if target region is within weapon attack range."""
+    if target_region == my_region:
+        return True
+
+    # Range 1 check
+    if weapon_range >= 1:
+        for r in state.connected_regions:
+            if r.id == target_region:
+                return True
+
+    # Range 2+ check via God Mode
+    if weapon_range >= 2 and intel and intel.available:
+        dist = intel.calculate_distance(my_region, target_region)
+        return dist <= weapon_range
+
+    return False
+
+
+def _pick_explore_target(state: GameState) -> dict | None:
+    """Terrain-based random move (no god mode — that's handled separately)."""
+    import random
+    from src.config import TERRAIN_EXPLORE_PRIORITY
+    from src.movement import _readable_name
+
+    # Avoid pending death zones
+    pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
+
+    candidates = state.safe_connections()
+    candidates = [r for r in candidates if r.id not in pending_ids]
+
+    if not candidates:
+        candidates = state.safe_connections()
+
+    if not candidates:
+        return None
+
+    # Sort by terrain priority, randomize within top tier
+    candidates.sort(
+        key=lambda r: TERRAIN_EXPLORE_PRIORITY.get(r.terrain, 0), reverse=True
+    )
+    top_priority = TERRAIN_EXPLORE_PRIORITY.get(candidates[0].terrain, 0)
+    top_tier = [
+        r
+        for r in candidates
+        if TERRAIN_EXPLORE_PRIORITY.get(r.terrain, 0) >= top_priority - 1
+    ]
+    target = random.choice(top_tier)
+
+    return {
+        "type": "move",
+        "regionId": target.id,
+        "_to_name": _readable_name(target),
+        "_reason": f"explore {target.terrain}",
+    }
+
+
+def decide_action(
+    state: GameState,
+    intel: GodModeIntel = None,
+    my_bot_ids: set = None,
+    target_lock: TargetLock = None,
+) -> dict:
+    """
+    AGGRESSIVE decision engine — per-turn evaluation, no permanent lock.
+
+    Armed: Attack anything in range every turn. No tunnel vision.
+    Unarmed: Defensive — find weapon first, only take guaranteed kills.
+    """
+
+    needs_weapon = state.weapon.name == "Fist"
+    pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
+    in_danger_zone = state.is_death_zone or (state.region_id in pending_ids)
+
+    # ──── THE PURGE (CHAOS MODE) ────
+    # Jika musuh asli (yang bukan teman) sudah tidak ada, saatnya baku hantam!
+    is_purge_time = False
+    public_enemies_count = 999
+    if intel and intel.available:
+        public_enemies = [
+            a
+            for a in intel.all_agents
+            if a.get("isAlive") and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
+        ]
+        public_enemies_count = len(public_enemies)
+        if public_enemies_count == 0:
+            is_purge_time = True
+
+    # Helper function to check if someone is an enemy
+    def is_enemy(agent_id: str, agent_name: str) -> bool:
+        if agent_id == state.self_info.id:
+            return False
+        if is_purge_time:
+            return True  # In Purge, EVERYONE is an enemy (except self)
+        if agent_id in (my_bot_ids or set()):
+            return False
+        if IS_FRIENDLY_REGEX.match(agent_name):
+            return False
+        return True
+
+    enemies_here = [e for e in state.enemies_in_region() if is_enemy(e.id, e.name)]
+
+    # ──── P0: Flee death zone (non-negotiable) ────
+    flee = must_flee_death_zone(state, intel, is_purge_time)
+    if flee:
+        return flee
+
+    # ──── P-1: THE SWEEPER PROTOCOL (Endgame Public Cleansing) ────
+    # Jika musuh publik tersisa <= 10, ABAIKAN SEMUANYA dan buru mereka sampai habis.
+    # KECUALI: jika HP Critical/Low DAN ada obat → wajib heal dulu, baru Sweeper.
+    _sweeper_needs_heal = (
+        is_critical(state) or needs_healing(state)
+    ) and has_heal_option(state)
+    if (
+        intel
+        and intel.available
+        and not is_purge_time
+        and 0 < public_enemies_count <= 10
+        and state.ep >= 1
+        and not _sweeper_needs_heal
+    ):
+        exclude_for_gm = my_bot_ids or set()
+        sweeper_target = intel.find_sweeper_target(
+            my_region_id=state.region_id,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+        )
+
+        if sweeper_target:
+            target_region = sweeper_target["region_id"]
+            dist_to_target = sweeper_target["dist"]
+
+            # Cek apakah bisa ditembak/dipukul langsung
+            can_snipe_sweeper = state.weapon.range >= dist_to_target
+            if not can_snipe_sweeper:
+                for inv_wep in state.weapons_in_inventory():
+                    if inv_wep.range >= dist_to_target:
+                        can_snipe_sweeper = True
+                        break
+
+            if can_snipe_sweeper and state.ep >= MIN_EP_ATTACK:
+                target = select_target(
+                    state,
+                    intel,
+                    my_bot_ids,
+                    pending_ids,
+                    is_purge_time,
+                    priority_target_id=sweeper_target["id"],
+                )
+                if target:
+                    target["_reason"] = (
+                        f"SWEEPER EXECUTION (Publik sisa {public_enemies_count})"
+                    )
+                    return target
+
+            # Jika tidak bisa ditembak, KEJAR!
+            if target_region != state.region_id:
+                hunt_move = move_toward_target(
+                    state,
+                    target_region,
+                    intel,
+                    pending_dz_ids=set(),  # Abaikan pending DZ (Sweeper tidak kenal takut)
+                    avoid_blobs=False,  # Menerobos kerumunan
+                    is_purge_time=is_purge_time,
+                )
+                if hunt_move:
+                    hunt_move["_reason"] = (
+                        f"SWEEPER CHASE: {sweeper_target['name']} (Sisa {public_enemies_count})"
+                    )
+                    return hunt_move
+
+    # ──── P0.1: ASSASSIN EXECUTION (DO OR DIE) ────
+    # Jika kita sudah berada di jangkauan tempur dengan Killer ATAU Sultan (≥30 Moltz),
+    # ABAIKAN SEMUANYA — eksekusi target terdekat!
+    # KECUALI: jika HP Critical/Low DAN ada obat → wajib heal dulu, baru eksekusi.
+    _p01_needs_heal = (is_critical(state) or needs_healing(state)) and has_heal_option(
+        state
+    )
+    if intel and intel.available and state.ep >= MIN_EP_ATTACK and not _p01_needs_heal:
+        exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+
+        killer = intel.find_killer_target(
+            my_region_id=state.region_id,
+            threshold=2,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+            pending_dz_ids=pending_ids,
+        )
+        sultan = intel.find_sultan_target(
+            my_region_id=state.region_id,
+            threshold=30,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+            pending_dz_ids=pending_ids,
+        )
+
+        # Pilih yang terdekat; seri → Killer lebih prioritas (lebih berbahaya)
+        p01_target = None
+        if killer and sultan:
+            dist_k = intel.calculate_distance(state.region_id, killer["region_id"])
+            dist_s = sultan["dist"]
+            p01_target = killer if dist_k <= dist_s else sultan
+        elif killer:
+            p01_target = killer
+        elif sultan:
+            p01_target = sultan
+
+        if p01_target:
+            dist_to_target = intel.calculate_distance(
+                state.region_id, p01_target["region_id"]
+            )
+            can_snipe_p01 = state.weapon.range >= dist_to_target
+            if not can_snipe_p01:
+                for inv_wep in state.weapons_in_inventory():
+                    if inv_wep.range >= dist_to_target:
+                        can_snipe_p01 = True
+                        break
+
+            if can_snipe_p01:
+                target = select_target(
+                    state,
+                    intel,
+                    my_bot_ids,
+                    pending_ids,
+                    is_purge_time,
+                    priority_target_id=p01_target["id"],
+                )
+                if target:
+                    is_sultan = "moltz" in p01_target
+                    label = (
+                        f"SULTAN EXECUTION (DO OR DIE - {p01_target['moltz']} Moltz)"
+                        if is_sultan
+                        else f"ASSASSIN EXECUTION (DO OR DIE - {p01_target.get('kills', 0)} Kills)"
+                    )
+                    target["_reason"] = label
+                    return target
+
+    # ──── P0.5: PENDING DZ EVACUATE (leave BEFORE it burns) ────
+    # If current region will become DZ next turn, move preemptively
+    if state.region_id in pending_ids and state.ep >= 1:
+        # KECUALI jika kita sedang bertarung dengan Killer ATAU Sultan di petak ini!
+        is_on_target_pdz = False
+        if intel and intel.available:
+            exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+            killer = intel.find_killer_target(
+                my_region_id=state.region_id,
+                threshold=2,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            sultan = intel.find_sultan_target(
+                my_region_id=state.region_id,
+                threshold=30,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            if (killer and killer["region_id"] == state.region_id) or (
+                sultan and sultan["region_id"] == state.region_id
+            ):
+                is_on_target_pdz = True
+
+        if not is_on_target_pdz:
+            flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
+            if flee:
+                flee["_reason"] = "pending DZ evacuation (leaving before it burns)"
+                return flee
+
+    # ──── P0.8: THE BUFFER ZONE PROTOCOL (Jaga Jarak 2 Petak dari DZ) ────
+    # Jika kita berada di pinggir jurang (Dist <= 1) dari DZ, MUNDUR ke area yang lebih dalam!
+    if intel and intel.available and state.ep >= 1:
+        dist_to_dz = intel.get_distance_to_nearest_dz(state.region_id, pending_ids)
+
+        # CEK: Jangan mundur jika kita sedang berhadapan dengan ATAU mengejar Killer/Sultan!
+        is_on_target_buffer = False
+        exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+        killer = intel.find_killer_target(
+            my_region_id=state.region_id,
+            threshold=2,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+            pending_dz_ids=pending_ids,
+        )
+        sultan = intel.find_sultan_target(
+            my_region_id=state.region_id,
+            threshold=30,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+            pending_dz_ids=pending_ids,
+        )
+        if killer or sultan:
+            is_on_target_buffer = True
+
+        if dist_to_dz <= 1 and not is_on_target_buffer:
+            # Cari tahu apakah ada tempat yang lebih aman (Dist >= 2) di map ini
+            safest_region = intel.find_safest_region(pending_dz_ids=pending_ids)
+            if safest_region and safest_region != state.region_id:
+                safe_dist = intel.get_distance_to_nearest_dz(safest_region, pending_ids)
+
+                # Mencegah spin-loop di akhir game: Hanya mundur jika titik teraman memang lebih dalam (Dist >= 2)
+                if safe_dist > 1:
+                    flee_move = move_toward_target(
+                        state,
+                        safest_region,
+                        intel,
+                        pending_dz_ids=pending_ids,
+                        avoid_blobs=False,  # Jangan pedulikan keramaian saat menyelamatkan nyawa
+                        is_purge_time=is_purge_time,
+                    )
+                    if flee_move:
+                        flee_move["_reason"] = (
+                            f"buffer zone retreat (too close to DZ, dist={dist_to_dz})"
+                        )
+                        return flee_move
+
+    # ──── P1: CRITICAL HP (< 40) — override everything ────
+    if is_critical(state):
+        heal = get_heal_action(state)  # EP-aware: returns None if EP < 1
+        if heal:
+            return heal
+        # EP = 0: rest to get EP for heal next turn
+        if has_heal_option(state):
+            return {
+                "type": "rest",
+                "_reason": f"rest for heal (HP:{state.hp}, EP:{state.ep})",
+            }
+        # No heal items: flee from enemies if possible
+        if enemies_here:
+            # Kecuali jika kita di sini untuk membunuh Killer atau Sultan! Jangan kabur!
+            is_on_target_p1 = False
+            if intel and intel.available:
+                exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+                killer = intel.find_killer_target(
+                    my_region_id=state.region_id,
+                    threshold=2,
+                    is_purge_time=is_purge_time,
+                    exclude_ids=exclude_for_gm,
+                    pending_dz_ids=pending_ids,
+                )
+                sultan = intel.find_sultan_target(
+                    my_region_id=state.region_id,
+                    threshold=30,
+                    is_purge_time=is_purge_time,
+                    exclude_ids=exclude_for_gm,
+                    pending_dz_ids=pending_ids,
+                )
+                if (killer and killer["region_id"] == state.region_id) or (
+                    sultan and sultan["region_id"] == state.region_id
+                ):
+                    is_on_target_p1 = True
+
+            if not is_on_target_p1:
+                flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
+                if flee:
+                    flee["_reason"] = f"flee (HP:{state.hp}, no heal)"
+                    return flee
+
+    # ──── P2: LOW HP (< 60) — heal BEFORE combat ────
+    if needs_healing(state):
+        heal = get_heal_action(state)  # EP-aware
+        if heal:
+            return heal
+        # EP = 0 + have heal items: rest for heal, NOT for attack
+        if has_heal_option(state):
+            return {
+                "type": "rest",
+                "_reason": f"rest for heal (HP:{state.hp}, EP:{state.ep})",
+            }
+
+    # ──── P2.5: NO MEDS PANIC (HP < 60) ────
+    if state.hp < LOW_HP and not has_heal_option(state) and enemies_here:
+        target = select_target(state, intel, my_bot_ids, pending_ids, is_purge_time)
+        # Check if the enemy is a free kill before running
+        reason = target.get("_reason", "").lower() if target else ""
+
+        # JANGAN KABUR JIKA KITA SEDANG MEMBURU KILLER ATAU SULTAN
+        is_on_target_p25 = False
+        if intel and intel.available:
+            exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+            killer = intel.find_killer_target(
+                my_region_id=state.region_id,
+                threshold=2,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            sultan = intel.find_sultan_target(
+                my_region_id=state.region_id,
+                threshold=30,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            if (killer and killer["region_id"] == state.region_id) or (
+                sultan and sultan["region_id"] == state.region_id
+            ):
+                is_on_target_p25 = True
+
+        if (
+            not is_on_target_p25
+            and "guaranteed" not in reason
+            and "kill-steal" not in reason
+        ):
+            flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
+            if flee:
+                flee["_reason"] = f"flee (HP:{state.hp}, no meds, dangerous enemies)"
+                return flee
+
+    # ──── P1.5: THE ABSOLUTE ASSASSIN PROTOCOL (Killer & Sultan Hunter) ────
+    # Cari Killer (kills >= 2) DAN Sultan (moltz >= 30) — kejar yang TERDEKAT.
+    # Tangan kosong (Fist) pun harus ikut maju jika target ada.
+    if intel and intel.available and state.ep >= MIN_EP_ATTACK:
+        exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+
+        killer = intel.find_killer_target(
+            my_region_id=state.region_id,
+            threshold=2,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+            pending_dz_ids=pending_ids,
+        )
+        sultan = intel.find_sultan_target(
+            my_region_id=state.region_id,
+            threshold=30,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+            pending_dz_ids=pending_ids,
+        )
+
+        # Pilih yang terdekat; seri → Killer lebih prioritas
+        assassin_target = None
+        assassin_label = ""
+        if killer and sultan:
+            dist_k = intel.calculate_distance(state.region_id, killer["region_id"])
+            dist_s = sultan["dist"]
+            if dist_k <= dist_s:
+                assassin_target = killer
+                assassin_label = f"Killer {killer['name']} ({killer['kills']} Kills)"
+            else:
+                assassin_target = sultan
+                assassin_label = f"Sultan {sultan['name']} ({sultan['moltz']} Moltz)"
+        elif killer:
+            assassin_target = killer
+            assassin_label = f"Killer {killer['name']} ({killer['kills']} Kills)"
+        elif sultan:
+            assassin_target = sultan
+            assassin_label = f"Sultan {sultan['name']} ({sultan['moltz']} Moltz)"
+
+        if assassin_target:
+            target_region = assassin_target["region_id"]
+            dist_to_target = intel.calculate_distance(state.region_id, target_region)
+
+            # Cek senjata di tas yang bisa menjangkau jarak ini (Smart Swap)
+            best_ranged_in_bag = None
+            if dist_to_target > 0:
+                for inv_weapon in state.weapons_in_inventory():
+                    if inv_weapon.range >= dist_to_target:
+                        if (
+                            not best_ranged_in_bag
+                            or inv_weapon.range > best_ranged_in_bag.range
+                        ):
+                            best_ranged_in_bag = inv_weapon
+
+            can_snipe = (state.weapon.range >= dist_to_target) or (
+                best_ranged_in_bag is not None
+            )
+
+            if target_region != state.region_id and not can_snipe:
+                # Kejar target!
+                hunt_move = move_toward_target(
+                    state,
+                    target_region,
+                    intel,
+                    pending_dz_ids=pending_ids,
+                    avoid_blobs=False,
+                    is_purge_time=is_purge_time,
+                )
+                if hunt_move:
+                    hunt_move["_reason"] = (
+                        f"ASSASSIN PROTOCOL: Memburu {assassin_label}!"
+                    )
+                    return hunt_move
+
+            # Jika bisa menembak (can_snipe == True), biarkan flow turun ke Armed Mode
+
+    # ──── P3: MOSHPIT EVACUATION (dynamic threshold based on alive count) ────
+    # Jangan evakuasi jika sedang fase Purge (kita memang ingin baku hantam!)
+    if not is_purge_time:
+        # CEK: Jangan takut keramaian jika Killer atau Sultan ada dalam jarak tembak!
+        is_on_target_moshpit = False
+        if intel and intel.available:
+            exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+            killer = intel.find_killer_target(
+                my_region_id=state.region_id,
+                threshold=2,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            sultan = intel.find_sultan_target(
+                my_region_id=state.region_id,
+                threshold=30,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            for tgt in [killer, sultan]:
+                if not tgt:
+                    continue
+                dist_to_t = intel.calculate_distance(state.region_id, tgt["region_id"])
+                if state.weapon.range >= dist_to_t:
+                    is_on_target_moshpit = True
+                    break
+                for inv_wep in state.weapons_in_inventory():
+                    if inv_wep.range >= dist_to_t:
+                        is_on_target_moshpit = True
+                        break
+                if is_on_target_moshpit:
+                    break
+
+        blob_threshold = (
+            intel.get_blob_threshold() if (intel and intel.available) else 3
+        )
+        if (
+            not is_on_target_moshpit
+            and len(enemies_here) >= blob_threshold
+            and state.ep >= 1
+        ):
+            flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
+            if flee:
+                flee["_reason"] = (
+                    f"moshpit evacuation ({len(enemies_here)}/{blob_threshold} enemies)"
+                )
+                return flee
+
+    # ──── UNARMED MODE — find weapon first ────
+    # Jangan cari senjata jika kita sedang memburu Killer/Sultan di petak yang sama!
+    if needs_weapon and state.ep >= 1:
+        is_on_target_melee = False
+        if intel and intel.available:
+            exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+            killer = intel.find_killer_target(
+                my_region_id=state.region_id,
+                threshold=2,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            sultan = intel.find_sultan_target(
+                my_region_id=state.region_id,
+                threshold=30,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            if (killer and killer["region_id"] == state.region_id) or (
+                sultan and sultan["region_id"] == state.region_id
+            ):
+                is_on_target_melee = True
+
+        if not is_on_target_melee:
+            # 1. Supply Cache (get weapon)
+            if state.current_region.interactables:
+                for fac in state.current_region.interactables:
+                    if fac.type in ("supply_cache", "supply") and not fac.is_used:
+                        return {
+                            "type": "interact",
+                            "interactableId": fac.id,
+                            "_name": "Supply Cache",
+                            "_reason": "get weapon from cache",
+                        }
+
+            # 2. Farm Weak Monsters (Wolf, Bear)
+            if state.ep >= MIN_EP_ATTACK:
+                monsters = sorted(
+                    state.monsters_in_region(),
+                    key=lambda m: -MONSTER_PRIORITY.get(m.name, 0),
+                )
+                for m in monsters:
+                    if m.name in ("Wolf", "Bear"):
+                        return {
+                            "type": "attack",
+                            "targetId": m.id,
+                            "targetType": "monster",
+                            "_name": m.name,
+                            "_hp": m.hp,
+                            "_reason": f"farm {m.name} (unarmed)",
+                        }
+
+    # ──── ARMED MODE — aggressive per-turn evaluation ────
+
+    target = None
+    # 3. ATTACK anything in range (guaranteed kill > lowest HP > monster > ranged)
+    if state.ep >= MIN_EP_ATTACK:
+        # Cek Killer dan Sultan — pilih yang terdekat sebagai priority_target
+        priority_id = None
+        if intel and intel.available:
+            exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+            killer = intel.find_killer_target(
+                my_region_id=state.region_id,
+                threshold=2,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            sultan = intel.find_sultan_target(
+                my_region_id=state.region_id,
+                threshold=30,
+                is_purge_time=is_purge_time,
+                exclude_ids=exclude_for_gm,
+                pending_dz_ids=pending_ids,
+            )
+            if killer and sultan:
+                dist_k = intel.calculate_distance(state.region_id, killer["region_id"])
+                dist_s = sultan["dist"]
+                priority_id = killer["id"] if dist_k <= dist_s else sultan["id"]
+            elif killer:
+                priority_id = killer["id"]
+            elif sultan:
+                priority_id = sultan["id"]
+
+        target = select_target(
+            state,
+            intel,
+            my_bot_ids,
+            pending_ids,
+            is_purge_time,
+            priority_target_id=priority_id,
+        )
+
+        if target:
+            reason = target.get("_reason", "").lower()
+            is_free_kill = "guaranteed" in reason
+            is_killer = "killer" in reason or "sultan" in reason
+
+            # If unarmed, skip ALL attacks here. EXCEPT if it is a KILLER/SULTAN!
+            if needs_weapon and not is_killer:
+                target = None
+
+            # 1 EP Reserve: Casual attacks on healthy targets need an extra EP (+1)
+            elif not is_free_kill and not is_killer and state.ep < (MIN_EP_ATTACK + 1):
+                target = None
+
+        if target:
+            return target
+
+    # ──── EP SAVE: enemies here but we didn't/couldn't attack ────
+    # We should only accumulate EP if we actually need more EP to attack
+    # If we have 10 EP (max), or we are unarmed (unarmed doesn't attack unless desperate),
+    # we shouldn't get stuck resting forever.
+    if enemies_here and not target and state.ep < (MIN_EP_ATTACK + 1):
+        if needs_weapon and state.ep >= MIN_EP_ATTACK:
+            pass  # Unarmed bots with enough EP should proceed to hunt/desperate melee
+        else:
+            # Accumulate EP to attack next turn
+            drink = get_energy_drink_action(state)
+            if drink:
+                drink["_reason"] = (
+                    f"EP boost for combat ({len(enemies_here)} enemies here)"
+                )
+                return drink
+            return {
+                "type": "rest",
+                "_reason": f"accumulate EP for attack ({len(enemies_here)} enemies, EP:{state.ep})",
+            }
+
+    # 4. Heal top-up — ONLY if region is clear and no weak enemy available
+    region_clear = not enemies_here
+
+    exclude_for_gm = {state.self_info.id} if is_purge_time else (my_bot_ids or set())
+    has_urgent_target = bool(
+        intel
+        and intel.available
+        and intel.find_weak_enemies(
+            exclude_ids=exclude_for_gm, is_purge_time=is_purge_time
+        )
+    )
+    if state.hp < 100 and region_clear and not has_urgent_target:
+        heal = get_heal_action(state, force=True)
+        if heal:
+            heal["_reason"] = f"top-up (HP:{state.hp}, region clear)"
+            return heal
+
+    # 5. EP Boost — only if HP is safe (not near healing threshold)
+    if state.hp >= LOW_HP:
+        drink = get_energy_drink_action(state)
+        if drink:
+            return drink
+
+    # 6. Supply cache — use free loot before moving away
+    cache = get_supply_cache(state)
+    if cache and state.ep >= 2:
+        return {
+            "type": "interact",
+            "interactableId": cache["id"],
+            "_name": "Supply Cache",
+            "_reason": "loot supply cache",
+        }
+
+    # 7. Rest if no EP (before any move/hunt that costs EP)
+    if should_rest(state):
+        return get_rest_action()
+
+    # 7.5 PANGGILAN SANG JENDERAL (SWARM TO CENTER)
+    # Jika sudah punya senjata, langsung jalan ngumpul ke tengah map yang aman (independen, tanpa Alpha).
+    if not needs_weapon and state.ep >= 2:
+        if intel and intel.available:
+            pusat_map = intel.find_safest_region(pending_dz_ids=pending_ids)
+            if pusat_map and pusat_map != state.region_id:
+                move = move_toward_target(
+                    state,
+                    pusat_map,
+                    intel,
+                    pending_dz_ids=pending_ids,
+                    avoid_blobs=False,
+                    is_purge_time=is_purge_time,
+                )
+                if move:
+                    move["_reason"] = "SWARM MODE: Berbaris ke Pusat Aman (Independen)"
+                    return move
+
+    # 8. God Mode hunt — move toward weak enemies / weapons / moltz
+    if intel and intel.available and state.ep >= 2:
+        pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
+        exclude_for_gm = {state.self_info.id} if is_purge_time else my_bot_ids
+        target_info = intel.get_target_region(
+            state.region_id,
+            exclude_for_gm,
+            needs_weapon=needs_weapon,
+            max_weapon_dist=2,
+            pending_dz_ids=pending_ids,
+            weapon_range=state.weapon.range,
+            is_purge_time=is_purge_time,
+        )
+        if target_info:
+            move = move_toward_target(
+                state,
+                target_info["region_id"],
+                intel,
+                pending_dz_ids=pending_ids,
+                is_purge_time=is_purge_time,
+            )
+            if move:
+                move["_reason"] = f"hunt: {target_info['reason']}"
+                return move
+
+    # 8.5 DESPERATE MELEE (Baku Hantam)
+    # If unarmed, couldn't find a weapon nearby, BUT there are enemies here... punch them instead of exploring!
+    if needs_weapon and state.ep >= MIN_EP_ATTACK:
+        if enemies_here:
+            enemies_here.sort(key=lambda e: e.hp)
+            target_enemy = enemies_here[0]
+            return {
+                "type": "attack",
+                "targetId": target_enemy.id,
+                "targetType": "agent",
+                "_name": target_enemy.name,
+                "_hp": target_enemy.hp,
+                "_reason": f"desperate melee (HP:{target_enemy.hp:.0f}, no weapon)",
+            }
+
+    # 9. Move to new area (terrain-based, no duplicate god mode)
+    if state.ep >= 2:
+        candidates = _pick_explore_target(state)
+        if candidates:
+            return candidates
+
+    return get_rest_action()

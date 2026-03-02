@@ -20,7 +20,9 @@ def _readable_name(region: RegionInfo) -> str:
     return region.name
 
 
-def must_flee_death_zone(state: GameState, intel: GodModeIntel = None) -> dict | None:
+def must_flee_death_zone(
+    state: GameState, intel: GodModeIntel = None, is_purge_time: bool = False
+) -> dict | None:
     """If in death zone, return move action to safest region.
 
     3-layer escape logic:
@@ -36,7 +38,7 @@ def must_flee_death_zone(state: GameState, intel: GodModeIntel = None) -> dict |
 
     # Layer 2: Godmode — find safest region and route there
     if intel and intel.available:
-        safest = intel.find_safest_region()
+        safest = intel.find_safest_region(pending_dz_ids=pending_ids)
         if safest and safest != state.region_id:
             next_step = intel.find_path_next_step(
                 state.region_id,
@@ -44,6 +46,7 @@ def must_flee_death_zone(state: GameState, intel: GodModeIntel = None) -> dict |
                 avoid_dz=True,
                 pending_dz=pending_ids,
                 avoid_blobs=False,
+                is_purge_time=is_purge_time,
             )
             if next_step:
                 name = intel.get_region_name(next_step)
@@ -98,6 +101,7 @@ def move_toward_target(
     intel: GodModeIntel = None,
     pending_dz_ids: set = None,
     avoid_blobs: bool = True,
+    is_purge_time: bool = False,
 ) -> dict | None:
     """
     Move one step toward a target region.
@@ -124,6 +128,7 @@ def move_toward_target(
             avoid_dz=True,
             pending_dz=pending_dz_ids,
             avoid_blobs=avoid_blobs,
+            is_purge_time=is_purge_time,
         )
         if next_step:
             region_name = intel.get_region_name(next_step)
@@ -138,7 +143,10 @@ def move_toward_target(
 
 
 def choose_explore_move(
-    state: GameState, intel: GodModeIntel = None, my_bot_ids: set = None
+    state: GameState,
+    intel: GodModeIntel = None,
+    my_bot_ids: set = None,
+    is_purge_time: bool = False,
 ) -> dict | None:
     """
     Choose best region to move to for exploration.
@@ -154,12 +162,25 @@ def choose_explore_move(
 
     # 1. God Mode targeted pathfinding (DZ-aware)
     if intel and intel.available:
+        exclude_for_gm = (
+            {state.self_info.id}
+            if is_purge_time
+            else (my_bot_ids or set()) | {state.self_info.id}
+        )
         target = intel.get_target_region(
-            state.region_id, my_bot_ids, pending_dz_ids=pending_ids
+            state.region_id,
+            exclude_for_gm,
+            pending_dz_ids=pending_ids,
+            is_purge_time=is_purge_time,
         )
         if target:
             move = move_toward_target(
-                state, target["region_id"], intel, pending_dz_ids=pending_ids
+                state,
+                target["region_id"],
+                intel,
+                pending_dz_ids=pending_ids,
+                avoid_blobs=True,
+                is_purge_time=is_purge_time,
             )
             if move:
                 move["_reason"] = f"target: {target['reason']}"
@@ -176,7 +197,10 @@ def choose_explore_move(
         and (
             not intel
             or not intel.available
-            or intel.get_region_enemy_count(r.id) < blob_limit
+            or intel.get_region_enemy_count(
+                r.id, is_purge_time, exclude_ids=my_bot_ids or set()
+            )
+            < blob_limit
         )
     ]
 
@@ -187,6 +211,13 @@ def choose_explore_move(
     if not candidates:
         # fallback layer 2: absolutely trapped, ignore pending DZ to escape current death
         candidates = state.safe_connections()
+
+    if not candidates:
+        # fallback layer 3: all connections are closed/death zones. Pick any to survive 1 more turn.
+        candidates = state.connected_regions
+
+    if not candidates:
+        return None
 
     # Sort by terrain priority, then randomize within same priority tier
     candidates.sort(

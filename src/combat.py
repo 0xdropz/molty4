@@ -47,10 +47,13 @@ def select_target(
     intel: GodModeIntel = None,
     my_bot_ids: set = None,
     pending_dz_ids: set = None,
+    is_purge_time: bool = False,
+    priority_target_id: str = None,
 ) -> dict | None:
     """
     AGGRESSIVE target selection. Returns action dict or None.
     Priority:
+    0. KILLER TARGET (Absolute Priority)
     1. One-hit kills (guaranteed kills — always take these)
     2. Kill-steal: enemies HP < KILL_STEAL_HP (lowest HP first)
     3. Enemies in same region (lowest HP first)
@@ -77,18 +80,34 @@ def select_target(
 
     # 1. Visible enemies
     for e in state.visible_enemies:
-        if e.is_alive and e.id not in friendly and not IS_FRIENDLY_REGEX.match(e.name):
-            if e.region_id not in forbidden_zones:
+        if not e.is_alive or e.id == si.id:
+            continue
+
+        is_friendly = bool(IS_FRIENDLY_REGEX.match(e.name))
+        is_own_bot = e.id in friendly
+
+        if is_purge_time:
+            is_friendly = False
+            is_own_bot = False  # Betrayal! Attack own bots too!
+
+        if not is_own_bot and not is_friendly:
+            if e.region_id not in forbidden_zones or e.id == priority_target_id:
                 potential_enemies.append(e)
 
     # 2. God Mode enemies (for Bow/Pistol/Sniper - Range >= 1)
     if weapon.range >= 1 and intel and intel.available:
-        gm_enemies = intel.find_all_enemies(exclude_ids=friendly)
+        exclude_for_gm = {si.id} if is_purge_time else (friendly | {si.id})
+        gm_enemies = intel.find_all_enemies(
+            exclude_ids=exclude_for_gm, is_purge_time=is_purge_time
+        )
         # Convert dict to simple object or use dict directly
         # Let's verify we don't duplicate visible ones
         visible_ids = {e.id for e in potential_enemies}
         for gem in gm_enemies:
-            if gem["id"] not in visible_ids and gem["region_id"] not in forbidden_zones:
+            if gem["id"] not in visible_ids and (
+                gem["region_id"] not in forbidden_zones
+                or gem["id"] == priority_target_id
+            ):
                 # Create extensive EnemyInfo from GM data
                 # (We don't know exact stats like def/atk, assume defaults)
                 e = EnemyInfo(
@@ -123,6 +142,21 @@ def select_target(
                 "same_region": dist == 0,
             }
         )
+
+    # 0. KILLER PRIORITY — Drop everything and kill the Killer!
+    if priority_target_id:
+        killer_targets = [t for t in all_targets if t["enemy"].id == priority_target_id]
+        if killer_targets:
+            best = killer_targets[0]
+            return {
+                "type": "attack",
+                "targetId": best["enemy"].id,
+                "targetType": "agent",
+                "_name": best["enemy"].name,
+                "_hp": best["enemy"].hp,
+                "_reason": f"KILLER TARGET (Must Kill!)",
+                "_dist": best["dist"],
+            }
 
     # 1. GUARANTEED KILLS — always take these, sorted by lowest HP
     guaranteed = [t for t in all_targets if t["one_hit"]]

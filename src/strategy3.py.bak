@@ -1,8 +1,8 @@
 """
-strategy.py — V5: CARNAL MODE
-Filosofi: Ngecamp di safest region (pusat peta). Serang SIAPAPUN dalam dist 1-3.
-Tidak ada konsep teman — IS_FRIENDLY_REGEX diabaikan sepenuhnya.
-Target: farming kill dan moltz sebanyak mungkin dari semua bot dan musuh.
+strategy.py — V3: THE ZONE CONTROLLER
+Filosofi: Kuasai pusat peta (safest region). Serang musuh dalam dist 1-3.
+Tidak mengejar Killer/Sultan jauh, tidak kabur dari moshpit.
+Chaos Mode aktif otomatis jika semua musuh non-friendly sudah habis.
 """
 
 from src.state_manager import GameState
@@ -147,15 +147,10 @@ def decide_action(
     my_bot_ids: set = None,
 ) -> dict:
     """
-    V5: ZONE ASSASSIN → CARNAL MODE decision engine.
-
-    Fase TRANSIT (belum di safest atau ada musuh publik di area):
-    - Normal Zone Controller. Gerak ke safest, heal, cari senjata, skip friendly.
-
-    Fase CARNAL (dist <= 1 dari safest DAN tidak ada musuh publik di dist 0-3):
-    - Predator murni. Ngecamp di safest, serang SIAPAPUN dalam dist 1-3.
-    - IS_FRIENDLY_REGEX diabaikan. Semua orang kecuali self adalah musuh.
-    - Dihitung dinamis setiap turn — aktif/nonaktif tergantung kondisi lapangan.
+    V3: ZONE CONTROLLER decision engine.
+    - Kuasai safest region di tengah peta
+    - Serang musuh dalam dist 1-3 dari safest region
+    - Chaos Mode jika semua musuh non-friendly habis
     """
 
     # Guard: self_info bisa None jika API return respons buruk → explore saja
@@ -171,6 +166,43 @@ def decide_action(
     needs_weapon = state.weapon.name == "Fist"
     pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
 
+    # ──── CHAOS MODE (PURGE) ────
+    # Jika semua musuh non-friendly sudah habis → serang siapapun
+    # Exclude my_bot_ids dan diri sendiri — mereka bukan musuh publik
+    # Guard: jangan aktifkan saat all_agents kosong (awal game / God View belum sync)
+    is_purge_time = False
+    public_enemies = []  # inisialisasi di luar guard → cegah NameError jika all_agents kosong
+    if intel and intel.available and len(intel.all_agents) > 0:
+        _own_ids = (my_bot_ids or set()) | {state.self_info.id}
+        public_enemies = [
+            a
+            for a in intel.all_agents
+            if a.get("isAlive")
+            and a.get("id") not in _own_ids
+            and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
+        ]
+        if len(public_enemies) == 0:
+            is_purge_time = True
+
+    def is_enemy(agent_id: str, agent_name: str) -> bool:
+        if agent_id == state.self_info.id:
+            return False
+        if is_purge_time:
+            return True
+        if agent_id in (my_bot_ids or set()):
+            return False
+        if IS_FRIENDLY_REGEX.match(agent_name):
+            return False
+        return True
+
+    enemies_here = [e for e in state.enemies_in_region() if is_enemy(e.id, e.name)]
+    # exclude_for_gm: set ID yang tidak boleh dijadikan target oleh God Mode queries.
+    # Selalu include self_info.id agar bot tidak menarget dirinya sendiri.
+    if is_purge_time:
+        exclude_for_gm = {state.self_info.id}
+    else:
+        exclude_for_gm = (my_bot_ids or set()) | {state.self_info.id}
+
     # Hitung safest region sekali di awal — dipakai oleh banyak blok
     safest_region_id = None
     dist_to_safest = 0
@@ -185,62 +217,6 @@ def decide_action(
                 max_dist=10,
             )
 
-    # ──── Carnal Mode: cek dinamis setiap turn ────
-    # Aktif jika bot sudah dist <= 1 dari safest region.
-    # Serang SIAPAPUN — musuh publik maupun friendly prefix — tanpa terkecuali.
-    is_carnal_mode = (
-        intel is not None
-        and intel.available
-        and safest_region_id is not None
-        and dist_to_safest <= 1
-    )
-
-    # ──── MODE SELECTION ────
-    if is_carnal_mode:
-        # ── CARNAL: semua orang kecuali self adalah musuh ──
-        # IS_FRIENDLY_REGEX diabaikan sepenuhnya.
-        is_purge_time = True
-        public_enemies = []
-
-        def is_enemy(agent_id: str, agent_name: str) -> bool:
-            return agent_id != state.self_info.id
-
-        enemies_here = [e for e in state.enemies_in_region() if is_enemy(e.id, e.name)]
-        exclude_for_gm = {state.self_info.id}
-
-    else:
-        # ── TRANSIT: normal Zone Controller — skip friendly prefix ──
-        is_purge_time = False
-        public_enemies = []
-        if intel and intel.available and len(intel.all_agents) > 0:
-            _own_ids = (my_bot_ids or set()) | {state.self_info.id}
-            public_enemies = [
-                a
-                for a in intel.all_agents
-                if a.get("isAlive")
-                and a.get("id") not in _own_ids
-                and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
-            ]
-            if len(public_enemies) == 0:
-                is_purge_time = True
-
-        def is_enemy(agent_id: str, agent_name: str) -> bool:
-            if agent_id == state.self_info.id:
-                return False
-            if is_purge_time:
-                return True
-            if agent_id in (my_bot_ids or set()):
-                return False
-            if IS_FRIENDLY_REGEX.match(agent_name):
-                return False
-            return True
-
-        enemies_here = [e for e in state.enemies_in_region() if is_enemy(e.id, e.name)]
-        if is_purge_time:
-            exclude_for_gm = {state.self_info.id}
-        else:
-            exclude_for_gm = (my_bot_ids or set()) | {state.self_info.id}
-
     # ──── P0: Flee death zone (non-negotiable) ────
     flee = must_flee_death_zone(state, intel, is_purge_time)
     if flee:
@@ -248,12 +224,73 @@ def decide_action(
 
     # ──── P0.5: PENDING DZ EVACUATE ────
     # Hanya flee jika ada region aman untuk dituju.
+    # Jika semua tetangga DZ/pending → stay, heal, dan attack dulu (P1-P4).
     if state.region_id in pending_ids and state.ep >= 1:
         if _has_safe_escape(state, pending_ids):
             flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
             if flee:
                 flee["_reason"] = "pending DZ evacuation (leaving before it burns)"
                 return flee
+        # Tidak ada safe escape → fall through ke P1/P4 (heal & attack dulu)
+
+    # ──── P0.8: SWEEPER PROTOCOL — buru last enemies ────
+    # Aktif jika public enemy <= 10 (hampir menang) dan tidak sedang butuh heal kritis.
+    # Sweeper BARBAR: boleh masuk pending DZ, tidak peduli kerumunan.
+    _sweeper_needs_heal = (
+        is_critical(state) or needs_healing(state)
+    ) and has_heal_option(state)
+    if (
+        intel
+        and intel.available
+        and not is_purge_time
+        and 0 < len(public_enemies) <= 10
+        and state.ep >= 1
+        and not _sweeper_needs_heal
+    ):
+        sweeper = intel.find_sweeper_target(
+            my_region_id=state.region_id,
+            is_purge_time=is_purge_time,
+            exclude_ids=exclude_for_gm,
+        )
+        if sweeper:
+            dist_to_sweeper = sweeper["dist"]
+            can_snipe_sw = state.weapon.range >= dist_to_sweeper
+            if not can_snipe_sw:
+                for inv_wep in state.weapons_in_inventory():
+                    if inv_wep.range >= dist_to_sweeper:
+                        can_snipe_sw = True
+                        break
+            if can_snipe_sw and state.ep >= MIN_EP_ATTACK:
+                attack = select_target(
+                    state,
+                    intel,
+                    exclude_for_gm,
+                    pending_ids,
+                    is_purge_time,
+                    priority_target_id=sweeper["id"],
+                )
+                if attack:
+                    attack["_reason"] = (
+                        f"SWEEPER: eksekusi {sweeper['name']} "
+                        f"(sisa {len(public_enemies)}, HP:{sweeper['hp']})"
+                    )
+                    return attack
+            elif sweeper["region_id"] != state.region_id:
+                # Barbar: pending_dz_ids=set() → boleh masuk pending DZ
+                hunt = move_toward_target(
+                    state,
+                    sweeper["region_id"],
+                    intel,
+                    pending_dz_ids=set(),
+                    avoid_blobs=False,
+                    is_purge_time=is_purge_time,
+                )
+                if hunt:
+                    hunt["_reason"] = (
+                        f"SWEEPER CHASE: {sweeper['name']} "
+                        f"(sisa {len(public_enemies)}, dist:{dist_to_sweeper})"
+                    )
+                    return hunt
 
     # ──── P1: CRITICAL HP (< 40) ────
     if is_critical(state):
@@ -337,13 +374,7 @@ def decide_action(
 
     # ──── P2.5: NO MEDS PANIC ────
     # Flee hanya jika ada region aman. Jika semua DZ → tetap stay, attack (P4) lebih baik.
-    # Saat Carnal: jangan pernah flee — keramaian adalah tujuan, bukan ancaman.
-    if (
-        not is_carnal_mode
-        and state.hp < LOW_HP
-        and not has_heal_option(state)
-        and enemies_here
-    ):
+    if state.hp < LOW_HP and not has_heal_option(state) and enemies_here:
         target = select_target(state, intel, exclude_for_gm, pending_ids, is_purge_time)
         reason = target.get("_reason", "").lower() if target else ""
         if "guaranteed" not in reason and "kill-steal" not in reason:
@@ -355,8 +386,7 @@ def decide_action(
             # Tidak ada safe escape → lanjut ke P3/P4, setidaknya coba attack
 
     # ──── P3: UNARMED MODE ────
-    # Saat Carnal: skip — tidak perlu cari senjata, langsung serang siapapun di P4/P7.5.
-    if needs_weapon and state.ep >= 1 and not is_carnal_mode:
+    if needs_weapon and state.ep >= 1:
         # Supply Cache
         if state.current_region and state.current_region.interactables:
             for fac in state.current_region.interactables:
@@ -401,16 +431,10 @@ def decide_action(
             is_free_kill = "guaranteed" in reason or "kill-steal" in reason
 
             # Bot unarmed: hanya ambil guaranteed/kill-steal, skip yang lain
-            # Saat Carnal: abaikan — unarmed pun tetap serang siapapun
-            if needs_weapon and not is_free_kill and not is_carnal_mode:
+            if needs_weapon and not is_free_kill:
                 target = None
             # EP Reserve: serangan biasa butuh 1 EP ekstra sebagai buffer
-            # Saat Carnal: abaikan — serang dengan EP seadanya
-            elif (
-                not is_free_kill
-                and not is_carnal_mode
-                and state.ep < (MIN_EP_ATTACK + 1)
-            ):
+            elif not is_free_kill and state.ep < (MIN_EP_ATTACK + 1):
                 target = None
 
         if target:
@@ -568,10 +592,10 @@ def decide_action(
                             )
                             return move
 
-    # ──── P7.5: DESPERATE MELEE — ada musuh di petak, serang dengan apapun ────
-    # Normal: hanya jika unarmed (Fist) — daripada kabur dan buang EP.
-    # Carnal: aktif selalu — jika ada musuh di petak dan EP cukup, tinju/serang mereka.
-    if state.ep >= MIN_EP_ATTACK and enemies_here and (needs_weapon or is_carnal_mode):
+    # ──── P7.5: DESPERATE MELEE — unarmed tapi ada musuh di petak ────
+    # Last resort sebelum gerak ke safest: daripada kabur dan buang EP,
+    # lebih baik tinju musuh terlemah yang ada.
+    if needs_weapon and state.ep >= MIN_EP_ATTACK and enemies_here:
         target_enemy = min(enemies_here, key=lambda e: e.hp)
         return {
             "type": "attack",

@@ -9,11 +9,11 @@ import time
 from src.api_client import ApiClient
 from src.state_manager import GameState
 from src.god_mode import GodModeIntel
-from src.strategy import decide_action, TargetLock
+from src.strategy import decide_action
 from src.loot import pickup_all_valuable, equip_best
 from src.combat import get_smart_swap_action, select_target
 from src.logger import BotLogger
-from src.config import TURN_INTERVAL, STATE_POLL_INTERVAL
+from src.config import TURN_INTERVAL, STATE_POLL_INTERVAL, IS_FRIENDLY_REGEX
 
 
 def is_api_error(resp: dict) -> bool:
@@ -64,7 +64,6 @@ class MoltyBot:
         self.agent_id = ""
         self.all_bot_ids = all_bot_ids or set()
         self.turn_count = 0
-        self.target_lock = TargetLock()
         self._last_state: GameState | None = None  # fallback for rate-limited state
         self._running = True
 
@@ -97,7 +96,6 @@ class MoltyBot:
                     self.game_id = ""
                     self.agent_id = ""
                     self.turn_count = 0
-                    self.target_lock = TargetLock()
                     await asyncio.sleep(10)
 
         except asyncio.CancelledError:
@@ -204,20 +202,6 @@ class MoltyBot:
                 # Exit polling loop and let the main run() loop restart the process
                 # which will immediately catch it in Step 1.
                 return False
-
-        return False
-
-        game = free_games[0]
-        game_id = game.get("id", "")
-        game_name = game.get("name", game_id)
-        self.logger.info(f'Found waiting free game: "{game_name}" ({game_id[:8]}...)')
-
-        result = await self._try_register(game_id, game_name)
-        if result == "ok":
-            return True
-        elif result == "recover":
-            # Account stuck — try recover again
-            return await self._recover_existing_game()
 
         return False
 
@@ -536,7 +520,16 @@ class MoltyBot:
                     try:
                         self.intel.update(full_state_resp)
                         if self.intel.available:
-                            weak = self.intel.find_weak_enemies()
+                            _own_ids_gm = self.all_bot_ids | {state.self_info.id}
+                            _is_purge_gm = len(self.intel.all_agents) > 0 and not any(
+                                a.get("isAlive")
+                                and a.get("id") not in _own_ids_gm
+                                and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
+                                for a in self.intel.all_agents
+                            )
+                            weak = self.intel.find_weak_enemies(
+                                is_purge_time=_is_purge_gm
+                            )
                             weapons = self.intel.find_high_value_weapons()
                             moltz = self.intel.find_moltz_locations()
                             alive_count = sum(
@@ -561,7 +554,28 @@ class MoltyBot:
                 )
 
                 # Check for smart swap based on best target
-                target_action = select_target(state, self.intel, self.all_bot_ids)
+                _pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
+                _own_ids = self.all_bot_ids | {state.self_info.id}
+                # _is_purge = True hanya jika:
+                # 1. God View aktif dan ada data
+                # 2. Ada minimal 1 agent NON-own yang hidup di map (guard early game)
+                # 3. Semua agent non-own yang hidup adalah friendly (tidak ada musuh publik)
+                _non_own_alive = [
+                    a
+                    for a in self.intel.all_agents
+                    if a.get("isAlive") and a.get("id") not in _own_ids
+                ]
+                _is_purge = (
+                    self.intel.available
+                    and len(_non_own_alive) > 0
+                    and not any(
+                        not IS_FRIENDLY_REGEX.match(a.get("name", ""))
+                        for a in _non_own_alive
+                    )
+                )
+                target_action = select_target(
+                    state, self.intel, self.all_bot_ids, _pending_ids, _is_purge
+                )
                 smart_swap = None
                 if (
                     target_action
@@ -578,7 +592,7 @@ class MoltyBot:
                         {"type": "equip", "itemId": smart_swap["itemId"]},
                         retries=1,
                     )
-                    if result.get("success"):
+                    if result and result.get("success"):
                         self.logger.equip(smart_swap.get("_name", "Weapon"))
                         # Refetch state so the main action uses the right weapon
                         state_resp = await self.api.get_state(
@@ -587,6 +601,10 @@ class MoltyBot:
                         if not is_api_error(state_resp):
                             state = GameState.from_api(state_resp)
                             self._last_state = state
+                            # Refresh _pending_ids dari state baru
+                            _pending_ids = {
+                                dz.get("id", "") for dz in state.pending_deathzones
+                            }
                 else:
                     await equip_best(
                         state,
@@ -598,16 +616,7 @@ class MoltyBot:
                     )
 
                 # ── Step 5: Main action (retry=2) ──
-                action = decide_action(
-                    state, self.intel, self.all_bot_ids, self.target_lock
-                )
-
-                # Log lock status
-                if self.target_lock.is_locked:
-                    self.logger.decision(
-                        f'LOCKED on "{self.target_lock.target_name}" '
-                        f"(chase: {self.target_lock.chase_turns}/{self.target_lock.max_chase_turns})"
-                    )
+                action = decide_action(state, self.intel, self.all_bot_ids)
 
                 self._log_action(action, state)
 

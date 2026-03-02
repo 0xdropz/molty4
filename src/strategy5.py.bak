@@ -186,14 +186,32 @@ def decide_action(
             )
 
     # ──── Carnal Mode: cek dinamis setiap turn ────
-    # Aktif jika bot sudah dist <= 1 dari safest region.
-    # Serang SIAPAPUN — musuh publik maupun friendly prefix — tanpa terkecuali.
-    is_carnal_mode = (
-        intel is not None
-        and intel.available
-        and safest_region_id is not None
-        and dist_to_safest <= 1
-    )
+    # Aktif jika: (1) bot sudah dist <= 1 dari safest DAN
+    #             (2) tidak ada musuh publik (non-friendly) di dist 0-3 dari safest.
+    # Jika musuh publik muncul → otomatis balik ke Transit.
+    # Break segera saat menemukan satu musuh publik (efisien, tidak loop semua agent).
+    is_carnal_mode = False
+    if intel and intel.available and safest_region_id and dist_to_safest <= 1:
+        _own_ids_carnal = (my_bot_ids or set()) | {state.self_info.id}
+        _public_nearby = False
+        for _agent in intel.all_agents:
+            if not _agent.get("isAlive"):
+                continue
+            if _agent.get("id", "") in _own_ids_carnal:
+                continue
+            if IS_FRIENDLY_REGEX.match(_agent.get("name", "")):
+                continue
+            _adist = intel.calculate_distance(
+                safest_region_id,
+                _agent.get("regionId", ""),
+                avoid_dz=True,
+                pending_dz=pending_ids,
+                max_dist=4,
+            )
+            if _adist <= 3:
+                _public_nearby = True
+                break
+        is_carnal_mode = not _public_nearby
 
     # ──── MODE SELECTION ────
     if is_carnal_mode:
@@ -337,13 +355,7 @@ def decide_action(
 
     # ──── P2.5: NO MEDS PANIC ────
     # Flee hanya jika ada region aman. Jika semua DZ → tetap stay, attack (P4) lebih baik.
-    # Saat Carnal: jangan pernah flee — keramaian adalah tujuan, bukan ancaman.
-    if (
-        not is_carnal_mode
-        and state.hp < LOW_HP
-        and not has_heal_option(state)
-        and enemies_here
-    ):
+    if state.hp < LOW_HP and not has_heal_option(state) and enemies_here:
         target = select_target(state, intel, exclude_for_gm, pending_ids, is_purge_time)
         reason = target.get("_reason", "").lower() if target else ""
         if "guaranteed" not in reason and "kill-steal" not in reason:
@@ -355,8 +367,7 @@ def decide_action(
             # Tidak ada safe escape → lanjut ke P3/P4, setidaknya coba attack
 
     # ──── P3: UNARMED MODE ────
-    # Saat Carnal: skip — tidak perlu cari senjata, langsung serang siapapun di P4/P7.5.
-    if needs_weapon and state.ep >= 1 and not is_carnal_mode:
+    if needs_weapon and state.ep >= 1:
         # Supply Cache
         if state.current_region and state.current_region.interactables:
             for fac in state.current_region.interactables:
@@ -401,16 +412,10 @@ def decide_action(
             is_free_kill = "guaranteed" in reason or "kill-steal" in reason
 
             # Bot unarmed: hanya ambil guaranteed/kill-steal, skip yang lain
-            # Saat Carnal: abaikan — unarmed pun tetap serang siapapun
-            if needs_weapon and not is_free_kill and not is_carnal_mode:
+            if needs_weapon and not is_free_kill:
                 target = None
             # EP Reserve: serangan biasa butuh 1 EP ekstra sebagai buffer
-            # Saat Carnal: abaikan — serang dengan EP seadanya
-            elif (
-                not is_free_kill
-                and not is_carnal_mode
-                and state.ep < (MIN_EP_ATTACK + 1)
-            ):
+            elif not is_free_kill and state.ep < (MIN_EP_ATTACK + 1):
                 target = None
 
         if target:
@@ -568,10 +573,10 @@ def decide_action(
                             )
                             return move
 
-    # ──── P7.5: DESPERATE MELEE — ada musuh di petak, serang dengan apapun ────
-    # Normal: hanya jika unarmed (Fist) — daripada kabur dan buang EP.
-    # Carnal: aktif selalu — jika ada musuh di petak dan EP cukup, tinju/serang mereka.
-    if state.ep >= MIN_EP_ATTACK and enemies_here and (needs_weapon or is_carnal_mode):
+    # ──── P7.5: DESPERATE MELEE — unarmed tapi ada musuh di petak ────
+    # Last resort sebelum gerak ke safest: daripada kabur dan buang EP,
+    # lebih baik tinju musuh terlemah yang ada.
+    if needs_weapon and state.ep >= MIN_EP_ATTACK and enemies_here:
         target_enemy = min(enemies_here, key=lambda e: e.hp)
         return {
             "type": "attack",

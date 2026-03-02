@@ -96,7 +96,11 @@ class GodModeIntel:
             if avoid_dz and rid in dz:
                 continue
             item = item_data.get("item", item_data)
-            if item.get("typeId") == "rewards" or item.get("category") == "currency":
+            if (
+                item.get("typeId") in ("rewards", "reward1")
+                or item.get("category") == "currency"
+                or "moltz" in item.get("name", "").lower()
+            ):
                 moltz.append(
                     {
                         "item": item,
@@ -107,7 +111,10 @@ class GodModeIntel:
         return moltz
 
     def find_weak_enemies(
-        self, exclude_ids: set = None, avoid_dz: bool = True
+        self,
+        exclude_ids: set = None,
+        avoid_dz: bool = True,
+        is_purge_time: bool = False,
     ) -> list[dict]:
         """Find enemies with low HP (kill-steal targets). Skip enemies in DZ."""
         exclude = exclude_ids or set()
@@ -117,11 +124,16 @@ class GodModeIntel:
             name = agent.get("name", "")
             aid = agent.get("id", "")
             rid = agent.get("regionId", "")
+
+            is_friendly = IS_FRIENDLY_REGEX.match(name)
+            if is_purge_time:
+                is_friendly = False
+
             if (
                 agent.get("isAlive")
                 and agent.get("hp", 100) < KILL_STEAL_HP
                 and aid not in exclude
-                and not IS_FRIENDLY_REGEX.match(name)
+                and not is_friendly
                 and rid not in dz
             ):
                 weak.append(
@@ -137,7 +149,10 @@ class GodModeIntel:
         return weak
 
     def find_all_enemies(
-        self, exclude_ids: set = None, avoid_dz: bool = True
+        self,
+        exclude_ids: set = None,
+        avoid_dz: bool = True,
+        is_purge_time: bool = False,
     ) -> list[dict]:
         """Find all living enemies, excluding our bots. Skip enemies in DZ."""
         exclude = exclude_ids or set()
@@ -145,16 +160,23 @@ class GodModeIntel:
         enemies = []
         for agent in self.all_agents:
             rid = agent.get("regionId", "")
+            name = agent.get("name", "")
+            aid = agent.get("id", "")
+
+            is_friendly = IS_FRIENDLY_REGEX.match(name)
+            if is_purge_time:
+                is_friendly = False
+
             if (
                 agent.get("isAlive")
-                and agent.get("id", "") not in exclude
-                and not IS_FRIENDLY_REGEX.match(agent.get("name", ""))
+                and aid not in exclude
+                and not is_friendly
                 and rid not in dz
             ):
                 enemies.append(
                     {
-                        "id": agent.get("id", ""),
-                        "name": agent.get("name", ""),
+                        "id": aid,
+                        "name": name,
                         "hp": agent.get("hp", 100),
                         "region_id": rid,
                         "region_name": self.get_region_name(rid),
@@ -162,16 +184,26 @@ class GodModeIntel:
                 )
         return enemies
 
-    def get_region_enemy_count(self, region_id: str) -> int:
+    def get_region_enemy_count(
+        self, region_id: str, is_purge_time: bool = False, exclude_ids: set = None
+    ) -> int:
         """Count how many non-friendly living enemies are in a region."""
         if not self.available or not self.all_agents:
             return 0
+        exclude = exclude_ids or set()
         count = 0
         for a in self.all_agents:
+            name = a.get("name", "")
+            aid = a.get("id", "")
+            is_friendly = IS_FRIENDLY_REGEX.match(name)
+            if is_purge_time:
+                is_friendly = False
+
             if (
                 a.get("regionId") == region_id
                 and a.get("isAlive")
-                and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
+                and not is_friendly
+                and aid not in exclude
             ):
                 count += 1
         return count
@@ -201,24 +233,76 @@ class GodModeIntel:
             return 4
         return 3
 
-    def find_safest_region(self) -> str | None:
-        """Find region with max BFS distance from all DZ edges (safe center compass)."""
+    def get_distance_to_nearest_dz(
+        self, region_id: str, pending_dz_ids: set = None
+    ) -> int:
+        """
+        Calculates the shortest BFS distance from the given region to any active or pending Death Zone.
+        Returns: 0 (Inside DZ), 1 (Adjacent to DZ), 2+ (Safe Buffer), or 999 (No DZ/Safe).
+        """
+        if not self.available or not self.all_regions:
+            return 999
+
+        dz_ids = self.dz_region_ids.copy()
+        if pending_dz_ids:
+            dz_ids.update(pending_dz_ids)
+
+        if not dz_ids:
+            return 999  # No death zones yet
+
+        if region_id in dz_ids:
+            return 0
+
+        # We do a reverse BFS: from all DZs outwards, until we hit the target region
+        visited = {}
+        queue = [(dz_id, 0) for dz_id in dz_ids]
+        for dz_id in dz_ids:
+            visited[dz_id] = 0
+
+        while queue:
+            current, dist = queue.pop(0)
+
+            # Optimization: If we found our region, return immediately
+            if current == region_id:
+                return dist
+
+            for neighbor in self.find_region_connections(current):
+                if neighbor not in visited:
+                    visited[neighbor] = dist + 1
+                    queue.append((neighbor, dist + 1))
+
+                    if neighbor == region_id:
+                        return dist + 1
+
+        return 999
+
+    def find_safest_region(self, pending_dz_ids: set = None) -> str | None:
+        """Find region with max BFS distance from all DZ edges (safe center compass).
+        Uses deterministic tie-breaking (alphabetical sort) to ensure all independent
+        bots always agree on the exact same 'safest' rally point."""
         if not self.available or not self.all_regions:
             return None
 
-        dz_ids = set()
+        dz_ids = self.dz_region_ids.copy()
+        if pending_dz_ids:
+            dz_ids.update(pending_dz_ids)
+
         safe_ids = []
         for r in self.all_regions:
             rid = r.get("id", "")
-            if r.get("isDeathZone"):
-                dz_ids.add(rid)
-            else:
+            if rid not in dz_ids:
                 safe_ids.append(rid)
 
         if not safe_ids:
             return None
+
+        # Fallback jika game baru mulai dan belum ada DZ:
+        # Gunakan region aman pertama (dengan sortir deterministik) sebagai pusat statis sementara
         if not dz_ids:
-            return None  # no DZ yet — let terrain scoring decide
+            safe_ids.sort()
+            return safe_ids[
+                len(safe_ids) // 2
+            ]  # Ambil nilai tengah dari map secara kasar
 
         # BFS simultaneously from ALL DZ edges to find max-distance region
         visited = {}
@@ -233,14 +317,224 @@ class GodModeIntel:
                     visited[neighbor] = dist + 1
                     queue.append((neighbor, dist + 1))
 
-        best_id, best_dist = None, -1
+        # Mencari max distance
+        best_dist = -1
         for rid in safe_ids:
             d = visited.get(rid, 0)
             if d > best_dist:
                 best_dist = d
-                best_id = rid
 
-        return best_id
+        # Kumpulkan semua kandidat yang memiliki jarak maksimal (seri/tie)
+        best_candidates = []
+        for rid in safe_ids:
+            if visited.get(rid, 0) == best_dist:
+                best_candidates.append(rid)
+
+        # Sortir secara alfabetikal untuk memastikan semua bot memilih ID yang 100% sama!
+        if best_candidates:
+            best_candidates.sort()
+            return best_candidates[0]
+
+        return None
+
+    def find_killer_target(
+        self,
+        my_region_id: str = None,
+        threshold: int = 2,
+        is_purge_time: bool = False,
+        exclude_ids: set = None,
+        pending_dz_ids: set = None,
+    ) -> dict | None:
+        """
+        X-Ray Radar: Find the enemy with highest Kills (The Killer Hunter).
+        Returns dict containing killer info and region_id.
+        Sorts by highest Kills.
+        Ignores killers that are currently inside the Death Zone.
+        """
+        if not self.available or not self.all_agents:
+            return None
+
+        exclude = exclude_ids or set()
+        killers = []
+
+        forbidden_zones = self.dz_region_ids.copy()
+        if pending_dz_ids:
+            forbidden_zones.update(pending_dz_ids)
+
+        for agent in self.all_agents:
+            name = agent.get("name", "")
+            aid = agent.get("id", "")
+            rid = agent.get("regionId", "")
+
+            # Jangan buru teman sendiri, kecuali saat Kiamat
+            is_friendly = IS_FRIENDLY_REGEX.match(name)
+            if is_purge_time:
+                is_friendly = False
+
+            if not agent.get("isAlive") or aid in exclude or is_friendly:
+                continue
+
+            # OPSI B: Jangan kejar Killer jika dia berada di dalam Death Zone!
+            # KECUALI jika kita sudah berada di petak yang sama dengannya (Siap adu mekanik!)
+            if rid in forbidden_zones and rid != my_region_id:
+                continue
+
+            kills = agent.get("kills", 0)
+
+            if kills >= threshold:
+                killers.append(
+                    {
+                        "id": aid,
+                        "name": name,
+                        "kills": kills,
+                        "region_id": rid,
+                        "region_name": self.get_region_name(rid),
+                    }
+                )
+
+        if not killers:
+            return None
+
+        # Urutkan berdasarkan Kills tertinggi (Pembunuh Berantai terbesar di atas)
+        killers.sort(key=lambda x: x["kills"], reverse=True)
+        return killers[0]
+
+    def find_sultan_target(
+        self,
+        my_region_id: str,
+        threshold: int = 30,
+        is_purge_time: bool = False,
+        exclude_ids: set = None,
+        pending_dz_ids: set = None,
+    ) -> dict | None:
+        """
+        Sultan Radar: Cari musuh yang membawa Moltz >= threshold di inventory-nya.
+        Data bocor via God View (Spectator API) tanpa autentikasi.
+        Sort: terdekat dulu, terkaya sebagai tiebreaker.
+        Skip musuh di DZ (kecuali sudah di petak yang sama dengan kita).
+        """
+        if not self.available or not self.all_agents:
+            return None
+
+        exclude = exclude_ids or set()
+        forbidden_zones = self.dz_region_ids.copy()
+        if pending_dz_ids:
+            forbidden_zones.update(pending_dz_ids)
+
+        candidates = []
+
+        for agent in self.all_agents:
+            name = agent.get("name", "")
+            aid = agent.get("id", "")
+            rid = agent.get("regionId", "")
+
+            if not agent.get("isAlive") or aid in exclude:
+                continue
+
+            is_friendly = IS_FRIENDLY_REGEX.match(name)
+            if is_purge_time:
+                is_friendly = False
+            if is_friendly:
+                continue
+
+            # Skip musuh di DZ kecuali sudah satu petak dengan kita
+            if rid in forbidden_zones and rid != my_region_id:
+                continue
+
+            # Hitung total Moltz di inventory
+            moltz_total = 0
+            for item_wrapper in agent.get("inventory", []):
+                item = item_wrapper.get("item", item_wrapper)
+                if (
+                    item.get("typeId") in ("rewards", "reward1")
+                    or item.get("category") == "currency"
+                    or "moltz" in item.get("name", "").lower()
+                ):
+                    moltz_total += (
+                        item_wrapper.get("quantity")
+                        or item_wrapper.get("amount")
+                        or item_wrapper.get("count")
+                        or item.get("quantity")
+                        or item.get("amount")
+                        or 1
+                    )
+
+            if moltz_total < threshold:
+                continue
+
+            dist = self.calculate_distance(
+                my_region_id,
+                rid,
+                avoid_dz=True,
+                pending_dz=pending_dz_ids,
+                max_dist=10,
+            )
+            candidates.append(
+                {
+                    "id": aid,
+                    "name": name,
+                    "moltz": moltz_total,
+                    "region_id": rid,
+                    "region_name": self.get_region_name(rid),
+                    "dist": dist,
+                    "kills": agent.get("kills", 0),
+                }
+            )
+
+        if not candidates:
+            return None
+
+        # Terdekat dulu, terkaya sebagai tiebreaker
+        candidates.sort(key=lambda x: (x["dist"], -x["moltz"]))
+        return candidates[0]
+
+    def find_sweeper_target(
+        self,
+        my_region_id: str,
+        is_purge_time: bool = False,
+        exclude_ids: set = None,
+    ) -> dict | None:
+        """
+        Find the best target for the Sweeper Protocol (closest, then lowest HP).
+        """
+        if not self.available or not self.all_agents or is_purge_time:
+            return None
+
+        exclude = exclude_ids or set()
+        candidates = []
+
+        for agent in self.all_agents:
+            name = agent.get("name", "")
+            aid = agent.get("id", "")
+            rid = agent.get("regionId", "")
+
+            if not agent.get("isAlive") or aid in exclude:
+                continue
+
+            is_friendly = IS_FRIENDLY_REGEX.match(name)
+            if is_purge_time:
+                is_friendly = False
+            if is_friendly:
+                continue
+
+            dist = self.calculate_distance(
+                my_region_id,
+                rid,
+                avoid_dz=True,
+                max_dist=10,
+            )
+            hp = agent.get("hp", 100)
+
+            candidates.append(
+                {"id": aid, "name": name, "region_id": rid, "dist": dist, "hp": hp}
+            )
+
+        if not candidates:
+            return None
+
+        # Sort by distance first, then HP (closest and weakest)
+        candidates.sort(key=lambda x: (x["dist"], x["hp"]))
+        return candidates[0]
 
     def get_target_region(
         self,
@@ -250,6 +544,7 @@ class GodModeIntel:
         max_weapon_dist: int = 3,
         pending_dz_ids: set = None,
         weapon_range: int = 0,
+        is_purge_time: bool = False,
     ) -> dict | None:
         """
         Targeted pathfinding: find best region to move toward.
@@ -275,7 +570,12 @@ class GodModeIntel:
             if w["region_id"] == my_region_id or w["region_id"] in forbidden_zones:
                 continue
             # Skip blob regions
-            if self.get_region_enemy_count(w["region_id"]) >= blob_threshold:
+            if (
+                self.get_region_enemy_count(
+                    w["region_id"], is_purge_time, exclude_ids=exclude
+                )
+                >= blob_threshold
+            ):
                 continue
             dist = self.calculate_distance(
                 my_region_id,
@@ -304,12 +604,19 @@ class GodModeIntel:
         # Only prioritize kill-steals heavily if we are armed.
         # If unarmed, we handle desperate hunting separately below.
         if not needs_weapon:
-            weak = self.find_weak_enemies(exclude_ids=exclude)
+            weak = self.find_weak_enemies(
+                exclude_ids=exclude, is_purge_time=is_purge_time
+            )
             for w in weak:
                 if w["region_id"] == my_region_id or w["region_id"] in forbidden_zones:
                     continue
                 # Skip blob regions
-                if self.get_region_enemy_count(w["region_id"]) >= blob_threshold:
+                if (
+                    self.get_region_enemy_count(
+                        w["region_id"], is_purge_time, exclude_ids=exclude
+                    )
+                    >= blob_threshold
+                ):
                     continue
                 dist = self.calculate_distance(
                     my_region_id,
@@ -345,7 +652,12 @@ class GodModeIntel:
             if m["region_id"] == my_region_id or m["region_id"] in forbidden_zones:
                 continue
             # Skip blob regions
-            if self.get_region_enemy_count(m["region_id"]) >= blob_threshold:
+            if (
+                self.get_region_enemy_count(
+                    m["region_id"], is_purge_time, exclude_ids=exclude
+                )
+                >= blob_threshold
+            ):
                 continue
             dist = self.calculate_distance(
                 my_region_id,
@@ -372,17 +684,22 @@ class GodModeIntel:
 
         # ── Hunt ANY enemy ──
         # If armed, this is our main hunt. If unarmed, this is a desperate hunt (low score)
-        enemies = self.find_all_enemies(exclude_ids=exclude)
+        enemies = self.find_all_enemies(
+            exclude_ids=exclude, is_purge_time=is_purge_time
+        )
         enemies = [
             e
             for e in enemies
-            if not IS_FRIENDLY_REGEX.match(e["name"])
-            and e["region_id"] != my_region_id
-            and e["region_id"] not in forbidden_zones
+            if e["region_id"] != my_region_id and e["region_id"] not in forbidden_zones
         ]
         for e in enemies:
             # Skip blob regions
-            if self.get_region_enemy_count(e["region_id"]) >= blob_threshold:
+            if (
+                self.get_region_enemy_count(
+                    e["region_id"], is_purge_time, exclude_ids=exclude
+                )
+                >= blob_threshold
+            ):
                 continue
             dist = self.calculate_distance(
                 my_region_id,
@@ -425,10 +742,15 @@ class GodModeIntel:
 
         # ── Safe center fallback (DZ-push: move toward safest region) ──
         # Score scales with DZ count: more DZ = more urgent = higher score
-        safest = self.find_safest_region()  # returns None if no DZ
+        safest = self.find_safest_region(
+            pending_dz_ids=pending_dz_ids
+        )  # returns None if no DZ
         if safest and safest != my_region_id:
             # Don't target safest if it's itself a blob
-            if self.get_region_enemy_count(safest) < blob_threshold:
+            if (
+                self.get_region_enemy_count(safest, is_purge_time, exclude_ids=exclude)
+                < blob_threshold
+            ):
                 dist = self.calculate_distance(
                     my_region_id,
                     safest,
@@ -472,6 +794,8 @@ class GodModeIntel:
         avoid_dz: bool = False,
         pending_dz: set = None,
         avoid_blobs: bool = False,
+        is_purge_time: bool = False,
+        exclude_ids: set = None,
     ) -> int:
         """
         Calculate hop distance between regions using BFS.
@@ -508,7 +832,10 @@ class GodModeIntel:
                     # Treat Moshpits as walls if avoid_blobs is active
                     if (
                         avoid_blobs
-                        and self.get_region_enemy_count(neighbor) >= blob_limit
+                        and self.get_region_enemy_count(
+                            neighbor, is_purge_time, exclude_ids=exclude_ids
+                        )
+                        >= blob_limit
                     ):
                         continue
 
@@ -525,6 +852,8 @@ class GodModeIntel:
         avoid_dz: bool = False,
         pending_dz: set = None,
         avoid_blobs: bool = False,
+        is_purge_time: bool = False,
+        exclude_ids: set = None,
     ) -> str | None:
         """
         BFS pathfinding: find next region to move to on the path from -> to.
@@ -565,7 +894,10 @@ class GodModeIntel:
                     # Treat Moshpits as walls if avoid_blobs is active
                     if (
                         avoid_blobs
-                        and self.get_region_enemy_count(next_id) >= blob_limit
+                        and self.get_region_enemy_count(
+                            next_id, is_purge_time, exclude_ids=exclude_ids
+                        )
+                        >= blob_limit
                     ):
                         continue
 

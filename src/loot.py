@@ -25,7 +25,12 @@ def should_pickup(item: ItemInfo, state: GameState, logger: BotLogger = None) ->
     Rejects all utility items (radios, maps, binoculars).
     """
     # 1. Always pickup Moltz / currency (stacks infinitely, takes 1 physical slot max)
-    if item.category == "currency" or item.type_id == "rewards" or "Moltz" in item.name:
+    # typeId bisa "rewards" atau "reward1" tergantung versi server
+    if (
+        item.category == "currency"
+        or item.type_id in ("rewards", "reward1")
+        or "moltz" in item.name.lower()
+    ):
         return True
 
     # Validation: Inventory full (non-stackable items)
@@ -148,7 +153,11 @@ def should_equip(state: GameState) -> ItemInfo | None:
 def get_pickup_priority(item: ItemInfo) -> int:
     """Priority score for picking up an item. Higher = pick first."""
     # Currency (Moltz) = highest priority
-    if item.type_id == "rewards" or item.category == "currency":
+    if (
+        item.type_id in ("rewards", "reward1")
+        or item.category == "currency"
+        or "moltz" in item.name.lower()
+    ):
         return 1000
 
     # Weapons by tier
@@ -190,7 +199,6 @@ async def pickup_all_valuable(
     if not region_items:
         return 0
 
-    # Sort by priority (highest first)
     # Sort by priority (highest first)
     region_items.sort(key=lambda ri: get_pickup_priority(ri.item), reverse=True)
 
