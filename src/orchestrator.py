@@ -89,18 +89,10 @@ class Orchestrator:
             except NotImplementedError:
                 pass  # Windows
 
-        # Staggered launch: register bots in waves to bypass Redis TTL limits
-        # Server rate limit (TOO_MANY_AGENTS_PER_IP) forgets IPs after ~15 seconds.
-        # We send 5 bots, wait 16 seconds, send 5 more, etc.
+        # Launch all bots immediately — no stagger delay
         self._tasks = []
         for i, bot in enumerate(self.bots):
-            batch_id = i // 5
-            # Delay each batch by 16 seconds (Redis Amnesia Window)
-            batch_delay = (batch_id * 16.0) + (i % 5) * 0.5
-
-            task = asyncio.create_task(
-                self._delayed_start(bot, delay=batch_delay), name=f"bot_{bot.name}"
-            )
+            task = asyncio.create_task(bot.run(), name=f"bot_{bot.name}")
             self._tasks.append(task)
 
         try:
@@ -114,12 +106,6 @@ class Orchestrator:
         print(f"{'=' * 60}")
         print(f"  All bots exited.")
         print(f"{'=' * 60}")
-
-    async def _delayed_start(self, bot: MoltyBot, delay: float):
-        """Start a bot with initial delay to stagger registration."""
-        if delay > 0:
-            await asyncio.sleep(delay)
-        await bot.run()
 
     def _handle_signal(self):
         """Handle Ctrl+C / SIGTERM."""
