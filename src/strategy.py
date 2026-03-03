@@ -1,8 +1,9 @@
 """
 strategy.py — V5: CARNAL MODE
-Filosofi: Ngecamp di safest region (pusat peta). Serang SIAPAPUN dalam dist 1-3.
-Tidak ada konsep teman — IS_FRIENDLY_REGEX diabaikan sepenuhnya.
-Target: farming kill dan moltz sebanyak mungkin dari semua bot dan musuh.
+Filosofi: Ngecamp di safest region (pusat peta).
+- Ada musuh non-prefix dist <= 3 dari safest → kejar & bunuh, lalu balik.
+- Tidak ada musuh non-prefix → bantai bot friendly (Carnal penuh).
+- Moltz adalah prioritas utama setelah selamatkan nyawa.
 """
 
 from src.state_manager import GameState
@@ -25,113 +26,6 @@ from src.config import (
 )
 
 
-def _pick_explore_target(state: GameState) -> dict | None:
-    """Terrain-based random move (no god mode)."""
-    import random
-    from src.config import TERRAIN_EXPLORE_PRIORITY
-    from src.movement import _readable_name
-
-    pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
-    candidates = state.safe_connections()
-    candidates = [r for r in candidates if r.id not in pending_ids]
-
-    if not candidates:
-        candidates = state.safe_connections()
-    if not candidates:
-        return None
-
-    candidates.sort(
-        key=lambda r: TERRAIN_EXPLORE_PRIORITY.get(r.terrain, 0), reverse=True
-    )
-    top_priority = TERRAIN_EXPLORE_PRIORITY.get(candidates[0].terrain, 0)
-    top_tier = [
-        r
-        for r in candidates
-        if TERRAIN_EXPLORE_PRIORITY.get(r.terrain, 0) >= top_priority - 1
-    ]
-    target = random.choice(top_tier)
-
-    return {
-        "type": "move",
-        "regionId": target.id,
-        "_to_name": _readable_name(target),
-        "_reason": f"explore {target.terrain}",
-    }
-
-
-def _find_chase_target(
-    intel: GodModeIntel,
-    my_region_id: str,
-    safest_region_id: str,
-    exclude_ids: set,
-    is_purge_time: bool,
-    pending_dz_ids: set,
-    max_dist: int = 3,
-) -> dict | None:
-    """
-    Cari musuh dalam dist 1-max_dist dari SAFEST REGION (bukan posisi bot).
-    Sort: terdekat dari safest, lalu HP terendah sebagai tiebreaker.
-    exclude_ids: set ID yang tidak boleh dijadikan target (self + own bots di non-purge).
-    """
-    if not intel or not intel.available:
-        return None
-
-    forbidden_zones = intel.dz_region_ids.copy()
-    if pending_dz_ids:
-        forbidden_zones.update(pending_dz_ids)
-
-    candidates = []
-    for agent in intel.all_agents:
-        name = agent.get("name", "")
-        aid = agent.get("id", "")
-        rid = agent.get("regionId", "")
-
-        if not agent.get("isAlive"):
-            continue
-
-        # Selalu skip diri sendiri dan bot yang dikecualikan
-        if aid in (exclude_ids or set()):
-            continue
-
-        is_friendly = IS_FRIENDLY_REGEX.match(name)
-        if is_purge_time:
-            is_friendly = False
-        if is_friendly:
-            continue
-
-        # Skip musuh di DZ
-        if rid in forbidden_zones:
-            continue
-
-        # Hitung jarak dari SAFEST REGION (bukan posisi bot saat ini)
-        # dist 0 = musuh sudah masuk safest region kita — prioritas tertinggi!
-        dist_from_safest = intel.calculate_distance(
-            safest_region_id, rid, avoid_dz=True, pending_dz=pending_dz_ids
-        )
-        if dist_from_safest > max_dist:
-            continue
-
-        hp = agent.get("hp", 100)
-        candidates.append(
-            {
-                "id": aid,
-                "name": name,
-                "region_id": rid,
-                "region_name": intel.get_region_name(rid),
-                "dist_from_safest": dist_from_safest,
-                "hp": hp,
-                "kills": agent.get("kills", 0),
-            }
-        )
-
-    if not candidates:
-        return None
-
-    # Terdekat dari safest dulu, lalu HP terendah
-    candidates.sort(key=lambda x: (x["dist_from_safest"], x["hp"]))
-    return candidates[0]
-
-
 def _has_safe_escape(state: GameState, pending_ids: set) -> bool:
     """
     Cek apakah ada minimal 1 region aman untuk dituju dari posisi sekarang.
@@ -141,21 +35,83 @@ def _has_safe_escape(state: GameState, pending_ids: set) -> bool:
     return any(r.id not in pending_ids for r in state.safe_connections())
 
 
+def _find_public_enemy_nearby(
+    intel: GodModeIntel,
+    safest_region_id: str,
+    self_id: str,
+    pending_ids: set,
+    max_dist: int = 3,
+) -> dict | None:
+    """
+    Scan musuh non-prefix dalam dist <= max_dist dari safest region.
+    Return kandidat terdekat dari safest (HP terendah sebagai tiebreaker), atau None.
+    """
+    if not intel or not intel.available or not safest_region_id:
+        return None
+
+    forbidden = intel.dz_region_ids | pending_ids
+    candidates = []
+
+    for agent in intel.all_agents:
+        if not agent.get("isAlive"):
+            continue
+        aid = agent.get("id", "")
+        aname = agent.get("name", "")
+        rid = agent.get("regionId", "")
+
+        if aid == self_id:
+            continue
+        if IS_FRIENDLY_REGEX.match(aname):
+            continue  # skip friendly prefix
+        if rid in forbidden:
+            continue
+
+        dist_from_safest = intel.calculate_distance(
+            safest_region_id,
+            rid,
+            avoid_dz=True,
+            pending_dz=pending_ids,
+            max_dist=max_dist + 1,
+        )
+        if dist_from_safest > max_dist:
+            continue
+
+        candidates.append(
+            {
+                "id": aid,
+                "name": aname,
+                "region_id": rid,
+                "region_name": intel.get_region_name(rid),
+                "dist_from_safest": dist_from_safest,
+                "hp": agent.get("hp", 100),
+            }
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: (x["dist_from_safest"], x["hp"]))
+    return candidates[0]
+
+
 def decide_action(
     state: GameState,
     intel: GodModeIntel = None,
     my_bot_ids: set = None,
 ) -> dict:
     """
-    V5: ZONE ASSASSIN → CARNAL MODE decision engine.
+    V5: CARNAL MODE decision engine.
 
-    Fase TRANSIT (belum di safest atau ada musuh publik di area):
-    - Normal Zone Controller. Gerak ke safest, heal, cari senjata, skip friendly.
+    Fase TRANSIT (dist > 1 dari safest):
+    - Gerak ke safest, heal, cari senjata, skip friendly prefix.
 
-    Fase CARNAL (dist <= 1 dari safest DAN tidak ada musuh publik di dist 0-3):
-    - Predator murni. Ngecamp di safest, serang SIAPAPUN dalam dist 1-3.
-    - IS_FRIENDLY_REGEX diabaikan. Semua orang kecuali self adalah musuh.
-    - Dihitung dinamis setiap turn — aktif/nonaktif tergantung kondisi lapangan.
+    Fase CARNAL (dist <= 1 dari safest):
+    - Ada musuh non-prefix dist <= 3 dari safest:
+        → Prioritaskan serang musuh non-prefix (IS_FRIENDLY_REGEX aktif).
+        → Melee: maju ke musuh. Ranged: tembak dari jarak.
+        → Jika musuh di luar jangkauan → move ke arah musuh (maks tetap di dist 3 safest).
+    - Tidak ada musuh non-prefix:
+        → Full Carnal: serang siapapun termasuk friendly prefix.
     """
 
     # Guard: self_info bisa None jika API return respons buruk → explore saja
@@ -186,8 +142,6 @@ def decide_action(
             )
 
     # ──── Carnal Mode: cek dinamis setiap turn ────
-    # Aktif jika bot sudah dist <= 1 dari safest region.
-    # Serang SIAPAPUN — musuh publik maupun friendly prefix — tanpa terkecuali.
     is_carnal_mode = (
         intel is not None
         and intel.available
@@ -197,31 +151,54 @@ def decide_action(
 
     # ──── MODE SELECTION ────
     if is_carnal_mode:
-        # ── CARNAL: semua orang kecuali self adalah musuh ──
-        # IS_FRIENDLY_REGEX diabaikan sepenuhnya.
-        is_purge_time = True
-        public_enemies = []
+        # Cek apakah ada musuh non-prefix dalam dist <= 3 dari safest
+        public_enemy = _find_public_enemy_nearby(
+            intel, safest_region_id, state.self_info.id, pending_ids, max_dist=3
+        )
 
-        def is_enemy(agent_id: str, agent_name: str) -> bool:
-            return agent_id != state.self_info.id
+        if public_enemy:
+            # ── CARNAL + MUSUH PUBLIK: prioritaskan non-prefix, skip friendly ──
+            is_purge_time = False
 
-        enemies_here = [e for e in state.enemies_in_region() if is_enemy(e.id, e.name)]
-        exclude_for_gm = {state.self_info.id}
+            def is_enemy(agent_id: str, agent_name: str) -> bool:
+                if agent_id == state.self_info.id:
+                    return False
+                if IS_FRIENDLY_REGEX.match(agent_name):
+                    return False
+                return True
+
+            enemies_here = [
+                e for e in state.enemies_in_region() if is_enemy(e.id, e.name)
+            ]
+            exclude_for_gm = (my_bot_ids or set()) | {state.self_info.id}
+
+        else:
+            # ── CARNAL PENUH: tidak ada musuh publik → bantai siapapun ──
+            is_purge_time = True
+            public_enemy = None
+
+            def is_enemy(agent_id: str, agent_name: str) -> bool:
+                return agent_id != state.self_info.id
+
+            enemies_here = [
+                e for e in state.enemies_in_region() if is_enemy(e.id, e.name)
+            ]
+            exclude_for_gm = {state.self_info.id}
 
     else:
-        # ── TRANSIT: normal Zone Controller — skip friendly prefix ──
+        # ── TRANSIT: normal — skip friendly prefix ──
         is_purge_time = False
-        public_enemies = []
+        public_enemy = None
         if intel and intel.available and len(intel.all_agents) > 0:
             _own_ids = (my_bot_ids or set()) | {state.self_info.id}
-            public_enemies = [
+            _public = [
                 a
                 for a in intel.all_agents
                 if a.get("isAlive")
                 and a.get("id") not in _own_ids
                 and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
             ]
-            if len(public_enemies) == 0:
+            if len(_public) == 0:
                 is_purge_time = True
 
         def is_enemy(agent_id: str, agent_name: str) -> bool:
@@ -247,7 +224,6 @@ def decide_action(
         return flee
 
     # ──── P0.5: PENDING DZ EVACUATE ────
-    # Hanya flee jika ada region aman untuk dituju.
     if state.region_id in pending_ids and state.ep >= 1:
         if _has_safe_escape(state, pending_ids):
             flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
@@ -261,12 +237,10 @@ def decide_action(
         if heal:
             return heal
         if has_heal_option(state):
-            # EP=0 tapi ada obat: minum energy drink dulu, kalau habis → move
             drink = get_energy_drink_action(state)
             if drink:
                 drink["_reason"] = f"EP boost untuk heal (HP:{state.hp})"
                 return drink
-            # Tidak ada energy drink → move ke safest sambil nunggu EP regen
             if safest_region_id and safest_region_id != state.region_id:
                 move = move_toward_target(
                     state,
@@ -277,18 +251,13 @@ def decide_action(
                     is_purge_time=is_purge_time,
                 )
                 if move:
-                    move["_reason"] = (
-                        f"move ke safest (HP kritis, tunggu EP untuk heal)"
-                    )
+                    move["_reason"] = "move ke safest (HP kritis, tunggu EP untuk heal)"
                     return move
-        # Tidak ada obat → flee hanya jika ada region aman.
-        # Jika semua tetangga DZ → stay dan rest (lebih baik daripada masuk DZ baru).
         if enemies_here and _has_safe_escape(state, pending_ids):
             flee = choose_explore_move(state, intel, my_bot_ids, is_purge_time)
             if flee:
                 flee["_reason"] = f"flee (HP:{state.hp}, no heal)"
                 return flee
-        # Tidak ada musuh dan tidak ada obat → move ke safest, jangan fall-through ke combat
         if safest_region_id and safest_region_id != state.region_id:
             move = move_toward_target(
                 state,
@@ -299,7 +268,7 @@ def decide_action(
                 is_purge_time=is_purge_time,
             )
             if move:
-                move["_reason"] = f"move ke safest (HP kritis, no meds)"
+                move["_reason"] = "move ke safest (HP kritis, no meds)"
                 return move
         return choose_explore_move(state, intel, my_bot_ids, is_purge_time) or {
             "type": "move",
@@ -311,13 +280,66 @@ def decide_action(
             "_reason": "fallback move (HP kritis)",
         }
 
+    # ──── P1.5: MOLTZ GRAB — kejar Moltz via God Mode ────
+    # Prioritas utama setelah selamatkan nyawa.
+    # Kejar Moltz dalam dist <= 3 dari safest region, tanpa syarat lain.
+    if intel and intel.available and safest_region_id and state.ep >= 1:
+        forbidden = intel.dz_region_ids | pending_ids
+        best_moltz = None
+        best_dist_from_bot = 999
+        best_dist_from_safest = 999
+
+        for m in intel.find_moltz_locations():
+            rid = m["region_id"]
+            if rid in forbidden:
+                continue
+            if rid == state.region_id:
+                continue  # dist 0 sudah handled FREE pickup
+
+            dist_from_safest = intel.calculate_distance(
+                safest_region_id,
+                rid,
+                avoid_dz=True,
+                pending_dz=pending_ids,
+                max_dist=10,
+            )
+            if dist_from_safest > 3:
+                continue
+
+            dist_from_bot = intel.calculate_distance(
+                state.region_id,
+                rid,
+                avoid_dz=True,
+                pending_dz=pending_ids,
+                max_dist=20,
+            )
+            if dist_from_bot < best_dist_from_bot:
+                best_dist_from_bot = dist_from_bot
+                best_dist_from_safest = dist_from_safest
+                best_moltz = m
+
+        if best_moltz:
+            move = move_toward_target(
+                state,
+                best_moltz["region_id"],
+                intel,
+                pending_dz_ids=pending_ids,
+                avoid_blobs=False,
+                is_purge_time=is_purge_time,
+            )
+            if move:
+                move["_reason"] = (
+                    f"MOLTZ GRAB: {best_moltz['region_name']} "
+                    f"(dist_bot:{best_dist_from_bot}, dist_safest:{best_dist_from_safest})"
+                )
+                return move
+
     # ──── P2: LOW HP (< 60) ────
     if needs_healing(state):
         heal = get_heal_action(state)
         if heal:
             return heal
         if has_heal_option(state):
-            # EP=0 tapi ada obat: minum energy drink dulu, kalau habis → move
             drink = get_energy_drink_action(state)
             if drink:
                 drink["_reason"] = f"EP boost untuk heal (HP:{state.hp})"
@@ -332,12 +354,11 @@ def decide_action(
                     is_purge_time=is_purge_time,
                 )
                 if move:
-                    move["_reason"] = f"move ke safest (low HP, tunggu EP untuk heal)"
+                    move["_reason"] = "move ke safest (low HP, tunggu EP untuk heal)"
                     return move
 
     # ──── P2.5: NO MEDS PANIC ────
-    # Flee hanya jika ada region aman. Jika semua DZ → tetap stay, attack (P4) lebih baik.
-    # Saat Carnal: jangan pernah flee — keramaian adalah tujuan, bukan ancaman.
+    # Saat Carnal: jangan pernah flee.
     if (
         not is_carnal_mode
         and state.hp < LOW_HP
@@ -352,12 +373,9 @@ def decide_action(
                 if flee:
                     flee["_reason"] = f"flee (HP:{state.hp}, no meds)"
                     return flee
-            # Tidak ada safe escape → lanjut ke P3/P4, setidaknya coba attack
 
-    # ──── P3: UNARMED MODE ────
-    # Saat Carnal: skip — tidak perlu cari senjata, langsung serang siapapun di P4/P7.5.
+    # ──── P3: UNARMED MODE (Transit only) ────
     if needs_weapon and state.ep >= 1 and not is_carnal_mode:
-        # Supply Cache
         if state.current_region and state.current_region.interactables:
             for fac in state.current_region.interactables:
                 if fac.type in ("supply_cache", "supply") and not fac.is_used:
@@ -368,7 +386,6 @@ def decide_action(
                         "_reason": "get weapon from cache",
                     }
 
-        # Farm Weak Monsters
         if state.ep >= MIN_EP_ATTACK:
             monsters = sorted(
                 state.monsters_in_region(),
@@ -385,33 +402,82 @@ def decide_action(
                         "_reason": f"farm {m.name} (unarmed)",
                     }
 
-    # ──── P4: ARMED MODE — serang musuh dalam jangkauan senjata ────
+    # ──── P4: ATTACK ────
+    # Carnal + musuh publik nearby: kejar & serang musuh non-prefix saja.
+    #   - Ranged: tembak dari posisi sekarang jika dalam jangkauan (tidak maju).
+    #   - Melee: maju ke musuh jika beda petak, serang jika sudah satu petak.
+    # Carnal penuh / Transit: serang berdasarkan is_enemy normal.
     target = None
     if state.ep >= MIN_EP_ATTACK:
-        target = select_target(
-            state,
-            intel,
-            exclude_for_gm,
-            pending_ids,
-            is_purge_time,
-        )
+        if is_carnal_mode and public_enemy:
+            # Cek apakah public_enemy bisa diserang dari posisi sekarang
+            dist_to_pub = intel.calculate_distance(
+                state.region_id,
+                public_enemy["region_id"],
+                avoid_dz=True,
+                pending_dz=pending_ids,
+                max_dist=10,
+            )
+            in_range = state.weapon.range >= dist_to_pub
+            if not in_range:
+                # Cek senjata di inventory
+                for inv_wep in state.weapons_in_inventory():
+                    if inv_wep.range >= dist_to_pub:
+                        in_range = True
+                        break
 
-        if target:
-            reason = target.get("_reason", "").lower()
-            is_free_kill = "guaranteed" in reason or "kill-steal" in reason
+            if in_range:
+                # Tembak dari sini (ranged) atau sudah satu petak (melee)
+                target = select_target(
+                    state,
+                    intel,
+                    exclude_for_gm,
+                    pending_ids,
+                    is_purge_time=False,
+                    priority_target_id=public_enemy["id"],
+                )
+            else:
+                # Tidak dalam jangkauan → maju ke arah musuh (melee chase)
+                # Guard: hanya maju jika musuh masih dist <= 3 dari safest
+                if public_enemy["dist_from_safest"] <= 3 and state.ep >= 1:
+                    move = move_toward_target(
+                        state,
+                        public_enemy["region_id"],
+                        intel,
+                        pending_dz_ids=pending_ids,
+                        avoid_blobs=False,
+                        is_purge_time=False,
+                    )
+                    if move:
+                        move["_reason"] = (
+                            f"CHASE PUBLIC ENEMY: {public_enemy['name']} "
+                            f"(dist:{dist_to_pub}, dist_safest:{public_enemy['dist_from_safest']})"
+                        )
+                        return move
+        else:
+            # Transit atau Carnal penuh tanpa musuh publik
+            target = select_target(
+                state,
+                intel,
+                exclude_for_gm,
+                pending_ids,
+                is_purge_time,
+            )
 
-            # Bot unarmed: hanya ambil guaranteed/kill-steal, skip yang lain
-            # Saat Carnal: abaikan — unarmed pun tetap serang siapapun
-            if needs_weapon and not is_free_kill and not is_carnal_mode:
-                target = None
-            # EP Reserve: serangan biasa butuh 1 EP ekstra sebagai buffer
-            # Saat Carnal: abaikan — serang dengan EP seadanya
-            elif (
-                not is_free_kill
-                and not is_carnal_mode
-                and state.ep < (MIN_EP_ATTACK + 1)
-            ):
-                target = None
+            if target:
+                reason = target.get("_reason", "").lower()
+                is_free_kill = "guaranteed" in reason or "kill-steal" in reason
+
+                # Transit unarmed: hanya guaranteed/kill-steal
+                if needs_weapon and not is_free_kill and not is_carnal_mode:
+                    target = None
+                # Transit: EP reserve
+                elif (
+                    not is_free_kill
+                    and not is_carnal_mode
+                    and state.ep < (MIN_EP_ATTACK + 1)
+                ):
+                    target = None
 
         if target:
             return target
@@ -423,7 +489,6 @@ def decide_action(
             if drink:
                 drink["_reason"] = f"EP boost for combat ({len(enemies_here)} enemies)"
                 return drink
-            # Tidak ada energy drink → mundur ke safest daripada diam
             if (
                 safest_region_id
                 and safest_region_id != state.region_id
@@ -445,20 +510,17 @@ def decide_action(
 
     # ──── P5: HEAL TOP-UP & LOOT (region clear) ────
     if not enemies_here:
-        # Heal top-up
         if state.hp < 100:
             heal = get_heal_action(state, force=True)
             if heal:
                 heal["_reason"] = f"top-up (HP:{state.hp})"
                 return heal
 
-        # Energy drink
         if state.hp >= LOW_HP:
             drink = get_energy_drink_action(state)
             if drink:
                 return drink
 
-        # Supply cache
         cache = get_supply_cache(state)
         if cache and state.ep >= 2:
             return {
@@ -468,109 +530,10 @@ def decide_action(
                 "_reason": "loot supply cache",
             }
 
-    # ──── P7: ZONE CONTROLLER — scan target dari safest region ────
-    if intel and intel.available and safest_region_id:
-        at_safest = state.region_id == safest_region_id
-
-        if at_safest or dist_to_safest <= 1:
-            # Sudah di safest (atau sangat dekat) → scan musuh di dist 1-3 dari safest
-            chase_target = _find_chase_target(
-                intel=intel,
-                my_region_id=state.region_id,
-                safest_region_id=safest_region_id,
-                exclude_ids=exclude_for_gm,
-                is_purge_time=is_purge_time,
-                pending_dz_ids=pending_ids,
-                max_dist=3,
-            )
-
-            if chase_target:
-                # Cek dulu apakah bisa ditembak dari posisi sekarang
-                dist_to_chase = intel.calculate_distance(
-                    state.region_id,
-                    chase_target["region_id"],
-                    avoid_dz=True,
-                    pending_dz=pending_ids,
-                    max_dist=10,
-                )
-                can_snipe_chase = state.weapon.range >= dist_to_chase
-                if not can_snipe_chase:
-                    for inv_wep in state.weapons_in_inventory():
-                        if inv_wep.range >= dist_to_chase:
-                            can_snipe_chase = True
-                            break
-
-                if can_snipe_chase and state.ep >= MIN_EP_ATTACK:
-                    # Bisa ditembak dari sini → serang langsung
-                    attack = select_target(
-                        state,
-                        intel,
-                        exclude_for_gm,
-                        pending_ids,
-                        is_purge_time,
-                        priority_target_id=chase_target["id"],
-                    )
-                    if attack:
-                        attack["_reason"] = (
-                            f"ZONE CTRL RANGED: {chase_target['name']} "
-                            f"(dist:{dist_to_chase}, HP:{chase_target['hp']})"
-                        )
-                        return attack
-
-                # Tidak bisa ditembak → kejar langsung (tanpa lock)
-                if state.ep >= 1:
-                    hunt = move_toward_target(
-                        state,
-                        chase_target["region_id"],
-                        intel,
-                        pending_dz_ids=pending_ids,
-                        avoid_blobs=False,
-                        is_purge_time=is_purge_time,
-                    )
-                    if hunt:
-                        hunt["_reason"] = (
-                            f"ZONE CTRL CHASE: {chase_target['name']} "
-                            f"(dist {chase_target['dist_from_safest']} dari safest, HP:{chase_target['hp']})"
-                        )
-                        return hunt
-
-            # Tidak ada target → God Mode Hunt Moltz/senjata di dist ≤ 2 saja
-            if state.ep >= 2:
-                target_info = intel.get_target_region(
-                    state.region_id,
-                    exclude_for_gm,
-                    needs_weapon=needs_weapon,
-                    max_weapon_dist=2,
-                    pending_dz_ids=pending_ids,
-                    weapon_range=state.weapon.range,
-                    is_purge_time=is_purge_time,
-                )
-                if target_info:
-                    # Hanya kejar jika tujuan masih dekat safest (dist <= 2)
-                    target_dist_from_safest = intel.calculate_distance(
-                        safest_region_id,
-                        target_info["region_id"],
-                        avoid_dz=True,
-                        pending_dz=pending_ids,
-                        max_dist=10,
-                    )
-                    if target_dist_from_safest <= 2:
-                        move = move_toward_target(
-                            state,
-                            target_info["region_id"],
-                            intel,
-                            pending_dz_ids=pending_ids,
-                            is_purge_time=is_purge_time,
-                        )
-                        if move:
-                            move["_reason"] = (
-                                f"hunt (dekat safest): {target_info['reason']}"
-                            )
-                            return move
-
-    # ──── P7.5: DESPERATE MELEE — ada musuh di petak, serang dengan apapun ────
-    # Normal: hanya jika unarmed (Fist) — daripada kabur dan buang EP.
-    # Carnal: aktif selalu — jika ada musuh di petak dan EP cukup, tinju/serang mereka.
+    # ──── P7.5: DESPERATE MELEE ────
+    # Transit: hanya jika unarmed.
+    # Carnal penuh: aktif selalu jika ada musuh di petak.
+    # Carnal + musuh publik: hanya jika musuh non-prefix ada di petak yang sama.
     if state.ep >= MIN_EP_ATTACK and enemies_here and (needs_weapon or is_carnal_mode):
         target_enemy = min(enemies_here, key=lambda e: e.hp)
         return {
@@ -582,7 +545,7 @@ def decide_action(
             "_reason": f"desperate melee: {target_enemy.name} (HP:{target_enemy.hp:.0f})",
         }
 
-    # ──── P8: GERAK KE SAFEST REGION ────
+    # ──── P8: BALIK KE SAFEST REGION ────
     if (
         intel
         and intel.available
@@ -599,13 +562,10 @@ def decide_action(
                 is_purge_time=is_purge_time,
             )
             if move:
-                move["_reason"] = (
-                    f"ZONE CTRL: Balik ke safest region (dist:{dist_to_safest})"
-                )
+                move["_reason"] = f"balik ke safest region (dist:{dist_to_safest})"
                 return move
 
     # ──── P9: FALLBACK MOVE ────
-    # Tidak pernah rest — selalu bergerak
     if safest_region_id and safest_region_id != state.region_id and state.ep >= 1:
         move = move_toward_target(
             state,
@@ -623,7 +583,7 @@ def decide_action(
     if explore:
         return explore
 
-    # Last resort: gerak ke tetangga manapun
+    # Last resort
     if state.connected_regions:
         return {
             "type": "move",
