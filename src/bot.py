@@ -12,6 +12,7 @@ from src.strategy import decide_action
 from src.loot import pickup_all_valuable, equip_best
 from src.combat import get_smart_swap_action, select_target
 from src.logger import BotLogger
+from src.god_mode import GodModeIntel
 from src.config import TURN_INTERVAL, STATE_POLL_INTERVAL
 
 
@@ -47,6 +48,7 @@ class MoltyBot:
         bot_index: int,
         all_api_keys: list[str],
         all_bot_ids: set = None,
+        god_cache=None,
         game_id: str = "",
         agent_id: str = "",
         rejoin_queue: asyncio.Queue = None,
@@ -60,11 +62,15 @@ class MoltyBot:
         self.api = ApiClient(self.api_key, bot_index=bot_index)
         self.logger = BotLogger(self.name, bot_index)
 
+        self.god_cache = god_cache
+        self.intel = None
+
         self.game_id = game_id
         self.agent_id = agent_id
         self.all_bot_ids = all_bot_ids or set()
         self.turn_count = 0
         self._last_state: GameState | None = None
+        self._god_mode_logged = False  # log GODMODE ACTIVE only once per game
 
         # Joiner signals this event when it assigns a new game after reincarnation
         self._ready_event: asyncio.Event = asyncio.Event()
@@ -101,9 +107,17 @@ class MoltyBot:
                     await self._request_rejoin()
                     continue
 
+                # Set fallback game number immediately (UUID short)
+                self.logger.update_game_number(self.game_id[:4])
+
                 self.logger.info(
                     f"game={self.game_id[:8]}.. agent={self.agent_id[:12]}.."
                 )
+
+                # Initialize God Mode V2 for this game
+                if self.god_cache:
+                    await self.god_cache.ensure_listening(self.game_id, self.api)
+                self.intel = GodModeIntel(self.god_cache, self.game_id)
 
                 # 3. Wait for game to start
                 started = await self._wait_for_start()
@@ -135,6 +149,7 @@ class MoltyBot:
         self.game_id = ""
         self.agent_id = ""
         self.turn_count = 0
+        self._god_mode_logged = False
         self._ready_event.clear()
         await self.rejoin_queue.put(self.account)
 
@@ -200,6 +215,15 @@ class MoltyBot:
 
             data = game_resp.get("data", game_resp)
             status = data.get("status", "")
+
+            # Extract game number from name (e.g. "30141st MoltyRoyale...")
+            game_name = data.get("name", "")
+            if game_name:
+                import re
+
+                match = re.search(r"\d+", game_name)
+                if match:
+                    self.logger.update_game_number(match.group(0))
 
             if status == "running":
                 self.logger.info("Game started!")
@@ -305,14 +329,6 @@ class MoltyBot:
                     await asyncio.sleep(STATE_POLL_INTERVAL)
                     continue
 
-                # Update logger stats
-                self.logger.update_stats(
-                    hp=state.hp,
-                    ep=state.ep,
-                    moltz=state.moltz_count,
-                    bag_count=state.bag_count,
-                )
-
                 # Log state summary
                 self.logger.state_summary(
                     region_name=state.region_name,
@@ -326,6 +342,15 @@ class MoltyBot:
                     is_death_zone=state.is_death_zone,
                 )
 
+                # Log God Mode activation once per game (not every turn)
+                if self.intel and self.intel.available and not self._god_mode_logged:
+                    agents = len(self.intel.all_agents)
+                    regions = len(self.intel.all_regions)
+                    self.logger.godmode(
+                        f"ACTIVE — agents={agents} regions={regions} game_status={self.intel.game_status}"
+                    )
+                    self._god_mode_logged = True
+
                 # ── Step 2: FREE actions — pickup then equip ──
                 await pickup_all_valuable(
                     state, self.api, self.game_id, self.agent_id, self.logger, retries=1
@@ -333,7 +358,7 @@ class MoltyBot:
 
                 _pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
                 target_action = select_target(
-                    state, None, self.all_bot_ids, _pending_ids, False
+                    state, self.intel, self.all_bot_ids, _pending_ids, False
                 )
                 smart_swap = None
                 if (
@@ -375,7 +400,7 @@ class MoltyBot:
                     )
 
                 # ── Step 5: Main action (retry=2) ──
-                action = decide_action(state, self.all_bot_ids)
+                action = decide_action(state, self.intel, self.all_bot_ids)
 
                 if action is None:
                     _retry_none_count += 1
@@ -442,6 +467,13 @@ class MoltyBot:
         action_type = action.get("type", "")
         reason = action.get("_reason", "")
         name = action.get("_name", "")
+
+        # Log God Mode-powered decisions prominently
+        reason_upper = reason.upper()
+        if any(
+            kw in reason_upper for kw in ("KILLER", "SULTAN", "DOOMSDAY", "SAFE CENTER")
+        ):
+            self.logger.godmode(f"Decision: {reason}")
 
         if action_type == "attack":
             self.logger.attack(

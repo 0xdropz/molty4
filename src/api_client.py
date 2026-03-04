@@ -200,6 +200,10 @@ class ApiClient:
         """GET /games/{gameId}/state — spectator full map (God Mode)."""
         return await self._request("GET", f"/games/{game_id}/state")
 
+    async def get_ws_endpoint(self, game_id: str) -> dict:
+        """GET /games/{gameId}/ws-endpoint — Get WebSocket URL for God Mode V2"""
+        return await self._request("GET", f"/games/{game_id}/ws-endpoint")
+
     # ─── Account APIs ────────────────────────────────
 
     async def get_account(self, api_key: str = "") -> dict:

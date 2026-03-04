@@ -65,9 +65,12 @@ MONSTER_PRIORITY = {
 
 # ─── Heal Item Priority (higher = use first) ─────────
 HEAL_PRIORITY = {
-    "medkit": 100,  # +50 HP
+    "Medkit": 100,  # +50 HP (Title case — server API name)
+    "medkit": 100,  # +50 HP (lowercase alias)
     "Bandage": 80,  # +30 HP
+    "bandage": 80,  # lowercase alias
     "Emergency rations": 60,  # +20 HP
+    "emergency rations": 60,  # lowercase alias
 }
 
 # ─── EP Recovery ─────────────────────────────────────

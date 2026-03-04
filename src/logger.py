@@ -23,28 +23,20 @@ class BotLogger:
         # File logger disabled to save disk I/O and CPU resources for large scale bots
         self._file_logger = None
 
-        # Current stats for the stats bar
-        self._hp = 0
-        self._ep = 0
-        self._moltz = 0
-        self._bag = 0
+        # Game number for prefix
+        self.game_num = "?"
 
-    def update_stats(self, hp: int, ep: int, moltz: int, bag_count: int):
-        """Update stats bar values from game state."""
-        self._hp = hp
-        self._ep = ep
-        self._moltz = moltz
-        self._bag = bag_count
+    def update_game_number(self, game_num: str):
+        """Update game number for prefix."""
+        self.game_num = game_num
 
-    def _stats_bar(self) -> str:
-        """Format: [HP:100 EP:10 $:50]"""
-        hp = int(round(self._hp)) if isinstance(self._hp, float) else self._hp
-        ep = int(round(self._ep)) if isinstance(self._ep, float) else self._ep
-        return f"[HP:{hp:<3} EP:{ep:<2} $:{self._moltz:<4}]"
+    def _prefix_tag(self) -> str:
+        """Format: [Game:30141]"""
+        return f"[Game:{self.game_num}]"
 
     def _format(self, tag: str, message: str) -> str:
-        """Format a log line with bot name, stats, tag, and message."""
-        return f"[{self.bot_name}] {self._stats_bar()} [{tag}] {message}"
+        """Format a log line with bot name, game num, tag, and message."""
+        return f"[{self.bot_name}] {self._prefix_tag()} [{tag}] {message}"
 
     def _print(self, tag: str, message: str, tag_color: str = ""):
         """Print to console with color and log to file."""
@@ -54,7 +46,7 @@ class BotLogger:
         colored_tag = f"{tag_color}{tag}{RESET_COLOR}" if tag_color else tag
         console_line = (
             f"{self.color}[{self.bot_name}]{RESET_COLOR} "
-            f"{DIM_COLOR}{self._stats_bar()}{RESET_COLOR} "
+            f"{DIM_COLOR}{self._prefix_tag()}{RESET_COLOR} "
             f"[{colored_tag}] {message}"
         )
 

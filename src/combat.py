@@ -4,6 +4,7 @@ Rank = Kills > HP, so prioritize getting kills over surviving.
 """
 
 from src.state_manager import GameState, EnemyInfo, MonsterInfo, WeaponInfo
+from src.god_mode import GodModeIntel
 from src.config import (
     KILL_STEAL_HP,
     MONSTER_PRIORITY,
@@ -43,7 +44,7 @@ def estimate_hits_to_kill(state: GameState, target_hp: float, target_def: int) -
 
 def select_target(
     state: GameState,
-    intel=None,
+    intel: GodModeIntel = None,
     my_bot_ids: set = None,
     pending_dz_ids: set = None,
     is_purge_time: bool = False,
@@ -96,7 +97,7 @@ def select_target(
     # Filter by range and calc damage
     all_targets = []
     for e in potential_enemies:
-        dist = _get_distance(state.region_id, e.region_id, state)
+        dist = _get_distance(state.region_id, e.region_id, state, intel)
 
         if dist > weapon.range:
             continue
@@ -114,32 +115,34 @@ def select_target(
             }
         )
 
-    # 0. KILLER PRIORITY — Drop everything and kill the Killer!
+    # 0. PRIORITY TARGET — Drop everything and kill the Sultan/Killer!
     if priority_target_id:
-        killer_targets = [t for t in all_targets if t["enemy"].id == priority_target_id]
-        if killer_targets:
-            best = killer_targets[0]
+        priority_targets = [
+            t for t in all_targets if t["enemy"].id == priority_target_id
+        ]
+        if priority_targets:
+            best = priority_targets[0]
             return {
                 "type": "attack",
                 "targetId": best["enemy"].id,
                 "targetType": "agent",
                 "_name": best["enemy"].name,
                 "_hp": best["enemy"].hp,
-                "_reason": f"KILLER TARGET (Must Kill!)",
+                "_reason": f"PRIORITY TARGET (Must Kill!)",
                 "_dist": best["dist"],
             }
 
-    # 1. GUARANTEED KILLS — always take these, sorted by lowest HP
+    # 1. GUARANTEED KILLS — always take these, sorted by lowest HP then ID
     guaranteed = [t for t in all_targets if t["one_hit"]]
-    guaranteed.sort(key=lambda t: t["enemy"].hp)
+    guaranteed.sort(key=lambda t: (t["enemy"].hp, t["enemy"].id))
 
     # 2. KILL-STEAL — low HP enemies (< KILL_STEAL_HP)
     kill_steal = [t for t in all_targets if t["enemy"].hp < KILL_STEAL_HP]
-    kill_steal.sort(key=lambda t: t["enemy"].hp)
+    kill_steal.sort(key=lambda t: (t["enemy"].hp, t["enemy"].id))
 
     # 3. SAME REGION enemies — lowest HP first
     region_enemies = [t for t in all_targets if t["same_region"]]
-    region_enemies.sort(key=lambda t: t["enemy"].hp)
+    region_enemies.sort(key=lambda t: (t["enemy"].hp, t["enemy"].id))
 
     action = None
     target_dist = 0
@@ -262,7 +265,9 @@ def get_smart_swap_action(state: GameState, target_dist: int) -> dict | None:
     return None
 
 
-def _get_distance(my_region: str, target_region: str, state: GameState) -> int:
+def _get_distance(
+    my_region: str, target_region: str, state: GameState, intel: GodModeIntel = None
+) -> int:
     """Calculate hop distance. 0=same, 1=adjacent, 2+=far."""
     if my_region == target_region:
         return 0
@@ -271,5 +276,9 @@ def _get_distance(my_region: str, target_region: str, state: GameState) -> int:
     for r in state.connected_regions:
         if r.id == target_region:
             return 1
+
+    # Check god mode for distance > 1 — use max_dist=6 to cover ranged weapons
+    if intel and intel.available:
+        return intel.calculate_distance(my_region, target_region, max_dist=6)
 
     return 999  # unknown distance

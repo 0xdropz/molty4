@@ -212,9 +212,6 @@ async def pickup_all_valuable(
             if not should_pickup(ri.item, state, logger):
                 continue
 
-            if logger:
-                logger.info(f'Attempting pickup: "{ri.item.name}"...')
-
             result = await api.do_action(
                 game_id,
                 agent_id,

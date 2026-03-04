@@ -5,6 +5,7 @@ connected regions, and pending deathzones.
 """
 
 from src.state_manager import GameState
+from src.god_mode import GodModeIntel
 from src.combat import select_target
 from src.survival import (
     is_critical,
@@ -23,6 +24,7 @@ from src.config import (
     MONSTER_PRIORITY,
     IS_FRIENDLY_REGEX,
     SULTAN_THRESHOLD,
+    KILLER_THRESHOLD,
 )
 
 
@@ -149,26 +151,27 @@ def _find_moltz_from_visible(state: "GameState") -> dict | None:
 
 def decide_action(
     state: GameState,
+    intel: GodModeIntel = None,
     my_bot_ids: set = None,
 ) -> dict:
     """
     V6: Local-state-only priority system.
 
-    P0  — In DZ: heal → EP drink (to unblock heal) → flee if safe exit exists
-            else fall through (no trapped combat, no rest — cascade handles it)
+    P0  — In DZ: heal → EP drink → flee if safe exit exists → else DOOMSDAY PROTOCOL (Spam Heal, Spam Drink, Attack, Rest)
     P1  — In pending DZ + EP >= 1: flee via get_safest_neighbor
     P2  — Critical HP (< 40): heal → EP drink
-    P3  — Sultan visible + EP >= 2 + in range: attack; EP >= 1: move toward
-    P4  — Enemy in region + EP >= 2: full aggro
-    P5  — HP < 60: heal → EP drink
-    P6  — Monster in region + EP >= 2: attack Wolf/Bear (Bandit always skipped)
-    P7  — Sultan visible but EP < 2: EP drink → move toward
+    P3  — Killer Active (>= 2 kills) + EP >= 1: Move/Attack
+    P4  — Sultan Active (>= 30 Moltz) + EP >= 1: Move/Attack
+    P5  — Enemy in region + EP >= 2: full aggro
+    P6  — HP < 60: heal → EP drink
+    P7  — Monster in region + EP >= 2: attack Wolf/Bear (Bandit always skipped)
     P8  — Supply cache in region + EP >= 1: interact
     P9  — Medical facility in region + HP < 100: interact
     P10 — Moltz on ground in other region + EP >= 1: move toward
-    P11 — EP >= 1: move to best terrain neighbor
-    P12 — EP = 0: rest
-    P13 — None (fallback)
+    P11 — Safest Region Fallback: Move to safe center
+    P12 — Move to best terrain neighbor (if no god mode)
+    P13 — Rest if EP = 0
+    P14 — None (fallback)
     """
 
     pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
@@ -183,24 +186,19 @@ def decide_action(
 
     enemies_here = [e for e in state.enemies_in_region() if is_enemy(e.id, e.name)]
 
-    # Sultan scan — visible range only (no God Mode)
-    sultan = _find_sultan_from_visible(state, threshold=SULTAN_THRESHOLD, my_id=my_id)
+    # Sultan and Killer scans
+    sultan = (
+        intel.find_sultan(SULTAN_THRESHOLD)
+        if (intel and intel.available)
+        else _find_sultan_from_visible(state, SULTAN_THRESHOLD, my_id)
+    )
+    killer = (
+        intel.find_killer(KILLER_THRESHOLD) if (intel and intel.available) else None
+    )
 
     # ── P0: DEATH ZONE ─────────────────────────────────────────────────────
     if state.is_death_zone:
-        # A. Heal if possible
-        heal = get_heal_action(state)
-        if heal:
-            return heal
-
-        # B. EP drink to unblock a heal we couldn't afford
-        if has_heal_option(state):
-            drink = get_energy_drink_action(state)
-            if drink:
-                drink["_reason"] = "EP boost to heal in DZ"
-                return drink
-
-        # C. Flee if there's a safe exit and we have EP
+        # A. Flee FIRST if there's a safe exit and we have EP — don't waste resources
         if state.ep >= 1:
             flee = get_safest_neighbor(state)
             # Only flee if the chosen neighbor is not also a death zone
@@ -208,8 +206,47 @@ def decide_action(
                 flee["_reason"] = "flee DZ → safest neighbor"
                 return flee
 
-        # D. No safe exit or no EP — fall through to P2+
-        # (rest at P12 will handle EP=0, cascade handles everything else)
+        # B. Heal if possible (no safe exit, or no EP to flee)
+        heal = get_heal_action(state)
+        if heal:
+            return heal
+
+        # C. EP drink to unblock a heal we couldn't afford
+        if has_heal_option(state):
+            drink = get_energy_drink_action(state)
+            if drink:
+                drink["_reason"] = "EP boost to heal in DZ"
+                return drink
+
+        # D. DOOMSDAY PROTOCOL: No safe exit — survive as long as possible
+        # NOTE: use_item costs 1 EP, so we can only act if ep >= 1
+        if state.ep >= MIN_EP_ATTACK:
+            # 1. Last Stand Attack (Hit anyone trapped here to get their drops)
+            if enemies_here:
+                target_enemy = min(enemies_here, key=lambda e: e.hp)
+                return {
+                    "type": "attack",
+                    "targetId": target_enemy.id,
+                    "targetType": "agent",
+                    "_name": target_enemy.name,
+                    "_hp": target_enemy.hp,
+                    "_reason": f"DOOMSDAY AGGRO: {target_enemy.name} (HP:{target_enemy.hp:.0f})",
+                }
+            # 2. Hit monsters
+            monsters = state.monsters_in_region()
+            if monsters:
+                m = monsters[0]
+                return {
+                    "type": "attack",
+                    "targetId": m.id,
+                    "targetType": "monster",
+                    "_name": m.name,
+                    "_hp": m.hp,
+                    "_reason": f"DOOMSDAY MONSTER: {m.name} (HP:{m.hp:.0f})",
+                }
+
+        # 5. Rest / Wait — regenerate 1 EP per turn
+        return get_rest_action()
 
     # ── P1: PENDING DZ — evacuate ──────────────────────────────────────────
     if state.region_id in pending_ids and state.ep >= 1:
@@ -229,29 +266,48 @@ def decide_action(
                 drink["_reason"] = f"EP boost to heal (HP:{state.hp:.0f})"
                 return drink
 
-    # ── P3: SULTAN VISIBLE + EP >= 2 ───────────────────────────────────────
-    if sultan and state.ep >= MIN_EP_ATTACK:
-        dist = sultan.get("dist", 999)
+    # ── P3: KILLER HUNTER ──────────────────────────────────────────────────
+    if killer and state.ep >= 1:
+        dist = (
+            intel.calculate_distance(state.region_id, killer["region_id"], max_dist=6)
+            if intel
+            else 999
+        )
         in_range = state.weapon.range >= dist
 
-        if in_range:
-            # Attack sultan directly if in same region
-            if sultan["region_id"] == state.region_id:
-                target = select_target(
-                    state,
-                    None,
-                    my_bot_ids or set(),
-                    pending_ids,
-                    is_purge_time=False,
-                    priority_target_id=sultan["id"],
+        if in_range and state.ep >= MIN_EP_ATTACK:
+            # Ranged: killer adjacent, weapon range covers it
+            if dist > 0:
+                return {
+                    "type": "attack",
+                    "targetId": killer["id"],
+                    "targetType": "agent",
+                    "_name": killer["name"],
+                    "_hp": None,
+                    "_reason": f"KILLER RANGED: {killer['name']} ({killer['kills']} Kills, dist:{dist})",
+                }
+            # Same region attack handled by P5 (AGGRO) with priority_target_id
+
+        # Killer not in range — move toward
+        if not in_range and state.ep >= 1:
+            move = move_toward_target(state, killer["region_id"], intel, pending_ids)
+            if move:
+                move["_reason"] = (
+                    f"KILLER CHASE: {killer['name']} ({killer['kills']} Kills, dist:{dist})"
                 )
-                if target:
-                    target["_reason"] = (
-                        f"SULTAN HUNT: {sultan['name']} ({sultan['moltz']} Moltz)"
-                    )
-                    return target
-            # Ranged: sultan adjacent, weapon range covers it
-            else:
+                return move
+
+    # ── P4: SULTAN HUNTER ──────────────────────────────────────────────────
+    if sultan and state.ep >= 1:
+        dist = (
+            intel.calculate_distance(state.region_id, sultan["region_id"], max_dist=6)
+            if intel
+            else sultan.get("dist", 999)
+        )
+        in_range = state.weapon.range >= dist
+
+        if in_range and state.ep >= MIN_EP_ATTACK:
+            if dist > 0:
                 return {
                     "type": "attack",
                     "targetId": sultan["id"],
@@ -264,11 +320,9 @@ def decide_action(
                     ),
                 }
 
-        # Sultan not in range — move toward (adjacent check only, no God Mode)
-        if state.ep >= 1:
-            move = move_toward_target(state, sultan["region_id"])
-            if not move:
-                move = get_safest_neighbor(state)
+        # Sultan not in range — move toward
+        if not in_range and state.ep >= 1:
+            move = move_toward_target(state, sultan["region_id"], intel, pending_ids)
             if move:
                 move["_reason"] = (
                     f"SULTAN CHASE: {sultan['name']} "
@@ -276,20 +330,28 @@ def decide_action(
                 )
                 return move
 
-    # ── P4: ENEMY IN REGION + EP >= 2 ──────────────────────────────────────
+    # ── P5: ENEMY IN REGION + EP >= 2 ──────────────────────────────────────
     if enemies_here and state.ep >= MIN_EP_ATTACK:
         sultan_here_id = (
             sultan["id"]
             if (sultan and sultan["region_id"] == state.region_id)
             else None
         )
+        killer_here_id = (
+            killer["id"]
+            if (killer and killer["region_id"] == state.region_id)
+            else None
+        )
+
+        priority_id = killer_here_id or sultan_here_id
+
         target = select_target(
             state,
-            None,
+            intel,
             my_bot_ids or set(),
             pending_ids,
             is_purge_time=False,
-            priority_target_id=sultan_here_id,
+            priority_target_id=priority_id,
         )
         if target:
             target["_reason"] = (
@@ -307,7 +369,7 @@ def decide_action(
             "_reason": f"AGGRO fallback: {target_enemy.name} (HP:{target_enemy.hp:.0f})",
         }
 
-    # ── P5: LOW HP (< 60) ──────────────────────────────────────────────────
+    # ── P6: LOW HP (< 60) ──────────────────────────────────────────────────
     if needs_healing(state):
         heal = get_heal_action(state)
         if heal:
@@ -318,7 +380,7 @@ def decide_action(
                 drink["_reason"] = f"EP boost to heal (HP:{state.hp:.0f})"
                 return drink
 
-    # ── P6: MONSTER IN REGION + EP >= 2 (skip Bandit) ──────────────────────
+    # ── P7: MONSTER IN REGION + EP >= 2 (skip Bandit) ──────────────────────
     if state.ep >= MIN_EP_ATTACK:
         monsters = [m for m in state.monsters_in_region() if m.name in ("Wolf", "Bear")]
         if monsters:
@@ -332,24 +394,6 @@ def decide_action(
                 "_hp": m.hp,
                 "_reason": f"MONSTER: {m.name} (HP:{m.hp:.0f})",
             }
-
-    # ── P7: SULTAN VISIBLE BUT EP < 2 ──────────────────────────────────────
-    if sultan and state.ep < MIN_EP_ATTACK:
-        drink = get_energy_drink_action(state)
-        if drink:
-            drink["_reason"] = f"EP boost for sultan hunt ({sultan['name']})"
-            return drink
-        # Move closer while EP is 1
-        if state.ep >= 1:
-            move = move_toward_target(state, sultan["region_id"])
-            if not move:
-                move = get_safest_neighbor(state)
-            if move:
-                move["_reason"] = (
-                    f"SULTAN APPROACH (EP<2): {sultan['name']} "
-                    f"({sultan['moltz']} Moltz)"
-                )
-                return move
 
     # ── P8: SUPPLY CACHE IN REGION + EP >= 1 ───────────────────────────────
     if state.ep >= 1:
@@ -377,25 +421,38 @@ def decide_action(
     if state.ep >= 1:
         moltz_target = _find_moltz_from_visible(state)
         if moltz_target:
-            move = move_toward_target(state, moltz_target["region_id"])
+            move = move_toward_target(
+                state, moltz_target["region_id"], intel, pending_ids
+            )
             if not move:
                 move = get_safest_neighbor(state)
             if move:
                 move["_reason"] = f"MOLTZ GRAB (dist:{moltz_target['dist']})"
                 return move
 
-    # ── P11: MOVE TO BEST TERRAIN NEIGHBOR + EP >= 1 ───────────────────────
+    # ── P11: SAFEST REGION FALLBACK ─────────────────────────────────────────
+    if state.ep >= 1 and intel and intel.available:
+        safe_center_id = intel.find_safest_region(pending_dz_ids=pending_ids)
+        if safe_center_id and safe_center_id != state.region_id:
+            move = move_toward_target(state, safe_center_id, intel, pending_ids)
+            if move:
+                move["_reason"] = (
+                    f"roam → Safe Center ({intel.get_region_name(safe_center_id)})"
+                )
+                return move
+
+    # ── P12: MOVE TO BEST TERRAIN NEIGHBOR (No God Mode Fallback) ───────────
     if state.ep >= 1:
         move = get_safest_neighbor(state)
         if move:
             move["_reason"] = f"roam → {move.get('_to_name', '?')}"
             return move
 
-    # ── P12: REST (EP = 0) ──────────────────────────────────────────────────
+    # ── P13: REST (EP = 0) ──────────────────────────────────────────────────
     if state.ep == 0:
         return get_rest_action()
 
-    # ── P13: FALLBACK ───────────────────────────────────────────────────────
+    # ── P14: FALLBACK ───────────────────────────────────────────────────────
     return None
 
 

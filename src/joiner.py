@@ -31,10 +31,17 @@ from src.config import CDN_URL, BASE_URL, API_TIMEOUT
 
 # Max agents per IP per game (hard API limit)
 MAX_PER_ROOM = 5
-# Poll interval when no new room available
-POLL_INTERVAL = 1
+# Poll interval for Web2 API
+POLL_INTERVAL = 0.5
+# Poll interval for Web3 RPC (must be slower to avoid IP Ban, block time is ~3s anyway)
+WEB3_POLL_INTERVAL = 2.0
 # Log "waiting for room" at most once every N seconds to avoid spam
 LOG_THROTTLE = 10
+
+# ── Web3 Sniper Config ────────────────────────────────────────────────────────
+RPC_URL = "https://mainnet.crosstoken.io:22001"
+ARENA_FREE = "0xAbC98bBe54e5bc495D97E6A9c51eEf14fd34e77D"
+EVENT_TOPIC = "0xd5195d721a86abeca98ed69ce3a94d30db00e153c904de359625e0dc8d2c77ae"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,6 +116,68 @@ async def _fetch_waiting_rooms(session: aiohttp.ClientSession) -> list[dict]:
         if g.get("entryType") == "free"
         and g.get("agentCount", 0) < g.get("maxAgents", 100)
     ]
+
+
+async def _get_latest_block(session: aiohttp.ClientSession) -> int:
+    """Ambil block terbaru dari RPC untuk Sniper."""
+    payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+    try:
+        async with session.post(RPC_URL, json=payload, ssl=False) as resp:
+            res = await resp.json()
+            return int(res.get("result", "0"), 16)
+    except Exception:
+        return 0
+
+
+async def _fetch_web3_rooms(
+    session: aiohttp.ClientSession, from_block: int, to_block: int
+) -> list[dict]:
+    """
+    Snipe Game ID dari Smart Contract ArenaFree sebelum API/CDN menampilkannya.
+    Mengekstrak Topic 1 (UUID) dari log event transaksi.
+    """
+    payload = {
+        "jsonrpc": "2.0",
+        "method": "eth_getLogs",
+        "params": [
+            {
+                "fromBlock": hex(from_block),
+                "toBlock": hex(to_block),
+                "address": ARENA_FREE,
+                "topics": [EVENT_TOPIC],
+            }
+        ],
+        "id": 1,
+    }
+    try:
+        async with session.post(RPC_URL, json=payload, ssl=False) as resp:
+            res = await resp.json()
+            logs = res.get("result", [])
+            games = []
+            if not logs:
+                return []
+
+            for log in logs:
+                topics = log.get("topics", [])
+                # Topic 1 berisi GameID dalam format Hex, selalu 64 chars (32 bytes EVM word)
+                if len(topics) >= 2:
+                    # EVM padding ditaruh di kiri. Kita ambil 32 karakter (16 bytes) paling kanan.
+                    raw_hex = topics[1].replace("0x", "")[-32:]
+                    # Pastikan panjangnya valid (32 chars) sebelum diformat
+                    if len(raw_hex) == 32:
+                        game_id = f"{raw_hex[:8]}-{raw_hex[8:12]}-{raw_hex[12:16]}-{raw_hex[16:20]}-{raw_hex[20:32]}"
+                        games.append(
+                            {
+                                "id": game_id,
+                                "name": f"[Web3 Snipe {game_id[:4]}]",
+                                "agentCount": 0,  # Asumsikan masih kosong karena sangat baru
+                                "maxAgents": 100,
+                                "entryType": "free",
+                            }
+                        )
+            return games
+    except Exception:
+        return []
 
 
 async def _register_one(
@@ -217,10 +286,12 @@ async def run_joiner(
     queue: deque[dict] = deque(accounts)
     filled_rooms: set[str] = set()
     last_log_time = 0.0
+    last_scanned_block = 0
+    last_web3_time = 0.0
 
     if verbose:
         _log(
-            f"Starting persistent joiner for {len(accounts)} accounts (max {MAX_PER_ROOM}/room)..."
+            f"Starting persistent joiner (Web2 & Web3 Sniper) for {len(accounts)} accounts (max {MAX_PER_ROOM}/room)..."
         )
 
     connector = aiohttp.TCPConnector(limit=100, keepalive_timeout=30)
@@ -228,6 +299,13 @@ async def run_joiner(
 
     async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
         while True:
+            now = time.monotonic()
+
+            # ── Garbage Collection: Prevent memory leak if running for months ──
+            if len(filled_rooms) > 1000:
+                # Sisakan 100 room terakhir (anggap set is un-ordered, clear setengahnya aja)
+                filled_rooms.clear()
+
             # ── Drain rejoin_queue: accounts that finished a game and need a new one ──
             while not rejoin_queue.empty():
                 try:
@@ -243,8 +321,35 @@ async def run_joiner(
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
-            rooms = await _fetch_waiting_rooms(session)
-            fresh_rooms = [r for r in rooms if r["id"] not in filled_rooms]
+            # ── Web3 Sniper Polling (Throttled to WEB3_POLL_INTERVAL) ──
+            web3_rooms = []
+            if now - last_web3_time >= WEB3_POLL_INTERVAL:
+                last_web3_time = now
+                current_block = await _get_latest_block(session)
+                if current_block > 0:
+                    if last_scanned_block == 0:
+                        last_scanned_block = current_block  # start fresh
+                    elif current_block >= last_scanned_block:
+                        web3_rooms = await _fetch_web3_rooms(
+                            session, last_scanned_block, current_block
+                        )
+                        if web3_rooms and verbose:
+                            _log(
+                                f"🔥 BINGO! Web3 Sniper mendeteksi {len(web3_rooms)} game baru di blockchain!"
+                            )
+                        last_scanned_block = current_block + 1
+
+            # ── Web2 API Polling (CDN/Fallback) ──
+            web2_rooms = await _fetch_waiting_rooms(session)
+
+            # Gabungkan dan hilangkan duplikasi (ID sama)
+            all_rooms_map = {}
+            for r in web3_rooms + web2_rooms:
+                all_rooms_map[r["id"]] = r
+
+            fresh_rooms = [
+                r for r in all_rooms_map.values() if r["id"] not in filled_rooms
+            ]
 
             if not fresh_rooms:
                 if verbose:

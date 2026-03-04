@@ -4,6 +4,7 @@ movement.py — Pathfinding, death zone avoidance, targeted movement.
 
 import re
 from src.state_manager import GameState, RegionInfo
+from src.god_mode import GodModeIntel
 from src.config import TERRAIN_EXPLORE_PRIORITY
 
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-")
@@ -75,11 +76,12 @@ def get_safest_neighbor(state: GameState) -> dict | None:
 def move_toward_target(
     state: GameState,
     target_region_id: str,
+    intel: GodModeIntel = None,
     pending_dz_ids: set = None,
 ) -> dict | None:
     """
     Move one step toward a target region.
-    Uses simple adjacency check (no God Mode pathfinding).
+    Uses simple adjacency check, then falls back to God Mode pathfinding if available.
     """
     if not target_region_id or target_region_id == state.region_id:
         return None
@@ -92,6 +94,23 @@ def move_toward_target(
                 "regionId": r.id,
                 "_to_name": _readable_name(r),
                 "_reason": "direct adjacent",
+            }
+
+    # Use God Mode pathfinding
+    if intel and intel.available:
+        next_step = intel.find_path_next_step(
+            state.region_id,
+            target_region_id,
+            avoid_dz=True,
+            pending_dz=pending_dz_ids,
+        )
+        if next_step:
+            region_name = intel.get_region_name(next_step)
+            return {
+                "type": "move",
+                "regionId": next_step,
+                "_to_name": region_name,
+                "_reason": "god mode pathfinding",
             }
 
     return None

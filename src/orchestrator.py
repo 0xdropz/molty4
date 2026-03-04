@@ -11,6 +11,7 @@ import os
 
 from src.bot import MoltyBot
 from src.joiner import run_joiner
+from src.god_mode_cache import GodModeCache
 
 
 class Orchestrator:
@@ -22,6 +23,7 @@ class Orchestrator:
         self.bots: list[MoltyBot] = []
         self.shared_bot_ids: set = set()
         self._tasks: list[asyncio.Task] = []
+        self.god_cache = GodModeCache()
 
         # Shared queue: bots push their account here when they need a new game
         self._rejoin_queue: asyncio.Queue = asyncio.Queue()
@@ -76,6 +78,7 @@ class Orchestrator:
                 bot_index=idx,
                 all_api_keys=all_keys,
                 all_bot_ids=self.shared_bot_ids,
+                god_cache=self.god_cache,
                 rejoin_queue=self._rejoin_queue,
             )
             self.bots.append(bot)
@@ -106,6 +109,8 @@ class Orchestrator:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         except asyncio.CancelledError:
             pass
+        finally:
+            await self.god_cache.close()
 
         print()
         print(f"{'=' * 60}")

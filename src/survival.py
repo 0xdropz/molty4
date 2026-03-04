@@ -77,7 +77,10 @@ def best_heal_item(state: GameState, force: bool = False) -> ItemInfo | None:
             return None
         allowed = recovery
 
-    allowed.sort(key=lambda i: HEAL_PRIORITY.get(i.name, 0), reverse=True)
+    allowed.sort(
+        key=lambda i: HEAL_PRIORITY.get(i.name, HEAL_PRIORITY.get(i.name.lower(), 0)),
+        reverse=True,
+    )
     return allowed[0]
 
 
