@@ -14,7 +14,6 @@ from src.config import (
     MAX_INVENTORY,
     WEAPON_TYPE_RANGED,
     WEAPON_TYPE_MELEE,
-    LOOT_TIER_S,
 )
 
 
@@ -122,7 +121,12 @@ def should_pickup(item: ItemInfo, state: GameState, logger: BotLogger = None) ->
             return False
         return True
 
-    # 4. Outright REJECT everything else (Utility, Map, Radio, Binoculars)
+    # 4. Utility: Binoculars — pickup if not already carrying one
+    if item.category == "utility" and item.name == "Binoculars":
+        already_has = any(i.name == "Binoculars" for i in state.self_info.inventory)
+        return not already_has
+
+    # 5. Outright REJECT everything else (Map, Radio, Megaphone, unknown utility)
     return False
 
 

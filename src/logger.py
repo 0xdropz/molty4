@@ -105,10 +105,9 @@ class BotLogger:
             "INTERACT", f'Used "{facility_name}" at "{region_name}"', "\033[95m"
         )
 
-    def flee(self, from_region: str, to_region: str):
-        self._print(
-            "FLEE", f'Escaping death zone "{from_region}" → "{to_region}"', "\033[91m"
-        )
+    def flee(self, from_region: str, to_region: str, reason: str = ""):
+        detail = f" ({reason})" if reason else " (Escaping death zone)"
+        self._print("FLEE", f'"{from_region}" → "{to_region}"{detail}', "\033[91m")
 
     def kill(self, target_name: str, region_name: str):
         self._print("KILL", f'KILLED "{target_name}" at "{region_name}"', "\033[91m")

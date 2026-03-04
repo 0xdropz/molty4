@@ -4,7 +4,6 @@ Rank = Kills > HP, so prioritize getting kills over surviving.
 """
 
 from src.state_manager import GameState, EnemyInfo, MonsterInfo, WeaponInfo
-from src.god_mode import GodModeIntel
 from src.config import (
     KILL_STEAL_HP,
     MONSTER_PRIORITY,
@@ -44,7 +43,7 @@ def estimate_hits_to_kill(state: GameState, target_hp: float, target_def: int) -
 
 def select_target(
     state: GameState,
-    intel: GodModeIntel = None,
+    intel=None,
     my_bot_ids: set = None,
     pending_dz_ids: set = None,
     is_purge_time: bool = False,
@@ -68,7 +67,7 @@ def select_target(
     my_region = state.region_id
     friendly = my_bot_ids or set()
 
-    forbidden_zones = intel.dz_region_ids.copy() if intel and intel.available else set()
+    forbidden_zones = set()
     if pending_dz_ids:
         forbidden_zones.update(pending_dz_ids)
     if state.is_death_zone:
@@ -94,38 +93,10 @@ def select_target(
             if e.region_id not in forbidden_zones or e.id == priority_target_id:
                 potential_enemies.append(e)
 
-    # 2. God Mode enemies (for Bow/Pistol/Sniper - Range >= 1)
-    if weapon.range >= 1 and intel and intel.available:
-        exclude_for_gm = {si.id} if is_purge_time else (friendly | {si.id})
-        gm_enemies = intel.find_all_enemies(
-            exclude_ids=exclude_for_gm, is_purge_time=is_purge_time
-        )
-        # Convert dict to simple object or use dict directly
-        # Let's verify we don't duplicate visible ones
-        visible_ids = {e.id for e in potential_enemies}
-        for gem in gm_enemies:
-            if gem["id"] not in visible_ids and (
-                gem["region_id"] not in forbidden_zones
-                or gem["id"] == priority_target_id
-            ):
-                # Create extensive EnemyInfo from GM data
-                # (We don't know exact stats like def/atk, assume defaults)
-                e = EnemyInfo(
-                    id=gem["id"],
-                    name=gem["name"],
-                    hp=gem["hp"],
-                    max_hp=100,
-                    atk=10,
-                    defense=5,  # assumptions
-                    region_id=gem["region_id"],
-                    is_alive=True,
-                )
-                potential_enemies.append(e)
-
     # Filter by range and calc damage
     all_targets = []
     for e in potential_enemies:
-        dist = _get_distance(state.region_id, e.region_id, state, intel)
+        dist = _get_distance(state.region_id, e.region_id, state)
 
         if dist > weapon.range:
             continue
@@ -291,9 +262,7 @@ def get_smart_swap_action(state: GameState, target_dist: int) -> dict | None:
     return None
 
 
-def _get_distance(
-    my_region: str, target_region: str, state: GameState, intel: GodModeIntel = None
-) -> int:
+def _get_distance(my_region: str, target_region: str, state: GameState) -> int:
     """Calculate hop distance. 0=same, 1=adjacent, 2+=far."""
     if my_region == target_region:
         return 0
@@ -302,9 +271,5 @@ def _get_distance(
     for r in state.connected_regions:
         if r.id == target_region:
             return 1
-
-    # Check god mode for distance > 1
-    if intel and intel.available:
-        return intel.calculate_distance(my_region, target_region)
 
     return 999  # unknown distance

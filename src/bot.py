@@ -8,12 +8,11 @@ import asyncio
 import time
 from src.api_client import ApiClient
 from src.state_manager import GameState
-from src.god_mode import GodModeIntel
 from src.strategy import decide_action
 from src.loot import pickup_all_valuable, equip_best
 from src.combat import get_smart_swap_action, select_target
 from src.logger import BotLogger
-from src.config import TURN_INTERVAL, STATE_POLL_INTERVAL, IS_FRIENDLY_REGEX
+from src.config import TURN_INTERVAL, STATE_POLL_INTERVAL
 
 
 def is_api_error(resp: dict) -> bool:
@@ -48,7 +47,6 @@ class MoltyBot:
         bot_index: int,
         all_api_keys: list[str],
         all_bot_ids: set = None,
-        god_cache=None,
         game_id: str = "",
         agent_id: str = "",
         rejoin_queue: asyncio.Queue = None,
@@ -61,8 +59,6 @@ class MoltyBot:
 
         self.api = ApiClient(self.api_key, bot_index=bot_index)
         self.logger = BotLogger(self.name, bot_index)
-        self.intel = GodModeIntel()
-        self.god_cache = god_cache
 
         self.game_id = game_id
         self.agent_id = agent_id
@@ -264,6 +260,8 @@ class MoltyBot:
         if not self.game_id or not self.agent_id:
             return
 
+        _retry_none_count = 0
+
         while self._running:
             try:
                 self.turn_count += 1
@@ -273,13 +271,10 @@ class MoltyBot:
                 jitter_delay = (self.bot_index % 100) * 0.05
                 await asyncio.sleep(jitter_delay)
 
-                # ── Step 1: Parallel fetch — state + god mode (shared cache) ──
-                god_source = self.god_cache if self.god_cache else self.api
-                state_resp, full_state_resp = await asyncio.gather(
-                    self.api.get_state(self.game_id, self.agent_id),
-                    god_source.get_full_state(self.game_id),
-                    return_exceptions=True,
-                )
+                # ── Step 1: Fetch agent state ──
+                # God Mode (get_full_state) disabled: API only allows spectator
+                # access for finished games, not running ones.
+                state_resp = await self.api.get_state(self.game_id, self.agent_id)
 
                 # Handle state errors — fallback to last known state
                 if isinstance(state_resp, Exception):
@@ -313,6 +308,12 @@ class MoltyBot:
                 # Build state — fresh or fallback
                 if state_resp is not None:
                     state = GameState.from_api(state_resp)
+                    # Detect kills
+                    if self._last_state and state.kills > self._last_state.kills:
+                        kills_gained = state.kills - self._last_state.kills
+                        for _ in range(kills_gained):
+                            self.logger.kill("Enemy", state.region_name)
+
                     self._last_state = state  # save for next time
                 else:
                     state = self._last_state
@@ -360,37 +361,14 @@ class MoltyBot:
                     is_death_zone=state.is_death_zone,
                 )
 
-                # ── Step 2: Process god mode result ──
-                if isinstance(full_state_resp, Exception):
-                    self.intel.available = False
-                else:
-                    try:
-                        self.intel.update(full_state_resp)
-                    except Exception:
-                        self.intel.available = False
-
-                # ── Step 4: FREE actions — pickup then equip ──
+                # ── Step 2: FREE actions — pickup then equip ──
                 await pickup_all_valuable(
                     state, self.api, self.game_id, self.agent_id, self.logger, retries=1
                 )
 
                 _pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
-                _own_ids = self.all_bot_ids | {state.self_info.id}
-                _non_own_alive = [
-                    a
-                    for a in self.intel.all_agents
-                    if a.get("isAlive") and a.get("id") not in _own_ids
-                ]
-                _is_purge = (
-                    self.intel.available
-                    and len(_non_own_alive) > 0
-                    and not any(
-                        not IS_FRIENDLY_REGEX.match(a.get("name", ""))
-                        for a in _non_own_alive
-                    )
-                )
                 target_action = select_target(
-                    state, self.intel, self.all_bot_ids, _pending_ids, _is_purge
+                    state, None, self.all_bot_ids, _pending_ids, False
                 )
                 smart_swap = None
                 if (
@@ -432,31 +410,48 @@ class MoltyBot:
                     )
 
                 # ── Step 5: Main action (retry=2) ──
-                action = decide_action(state, self.intel, self.all_bot_ids)
+                action = decide_action(state, self.all_bot_ids)
 
-                self._log_action(action, state)
+                if action is None:
+                    _retry_none_count += 1
+                    if _retry_none_count <= 3:
+                        self.logger.warn(
+                            f"decide_action returned None (retry {_retry_none_count}/3). Re-evaluating..."
+                        )
+                        # Bot akan skip sisa kode di bawah, kembali ke awal while loop,
+                        # dan nge-fetch state terbaru tanpa menunggu 60 detik.
+                        continue
+                    else:
+                        # Udah mentok re-evaluate 3 kali tetep dapet None,
+                        # berarti murni lagi nunggu EP. Gak usah kirim apa-apa ke server.
+                        self.logger.info("Standing by. Auto-regen +1 EP...")
+                        _retry_none_count = 0
+                        # Lanjut ke baris absolute clock sync di bawah untuk tidur
+                else:
+                    _retry_none_count = 0
+                    self._log_action(action, state)
 
-                clean_action = {
-                    k: v for k, v in action.items() if not k.startswith("_")
-                }
+                    clean_action = {
+                        k: v for k, v in action.items() if not k.startswith("_")
+                    }
 
-                thought = {
-                    "reasoning": (
-                        f"T{self.turn_count} HP:{state.hp} EP:{state.ep} "
-                        f"W:{state.weapon.name} K:{state.kills}"
-                    ),
-                    "plannedAction": clean_action.get("type", "rest"),
-                }
+                    thought = {
+                        "reasoning": (
+                            f"T{self.turn_count} HP:{state.hp} EP:{state.ep} "
+                            f"W:{state.weapon.name} K:{state.kills}"
+                        ),
+                        "plannedAction": clean_action.get("type", "rest"),
+                    }
 
-                result = await self.api.do_action(
-                    self.game_id, self.agent_id, clean_action, thought, retries=2
-                )
+                    result = await self.api.do_action(
+                        self.game_id, self.agent_id, clean_action, thought, retries=2
+                    )
 
-                if is_api_error(result):
-                    msg, code = get_error_info(result)
-                    self.logger.warn(f"Action failed: {code}")
-                    if "cooldown" in msg.lower() or "wait" in msg.lower():
-                        await asyncio.sleep(5)
+                    if is_api_error(result):
+                        msg, code = get_error_info(result)
+                        self.logger.warn(f"Action failed: {code}")
+                        if "cooldown" in msg.lower() or "wait" in msg.lower():
+                            await asyncio.sleep(5)
 
                 # Wait for next turn: Absolute Clock Sync
                 # Rather than sleeping exactly 61s (which causes accumulated time drift),
@@ -491,7 +486,10 @@ class MoltyBot:
             )
         elif action_type == "move":
             to_name = action.get("_to_name", action.get("regionId", ""))
-            self.logger.move(state.region_name, to_name, reason)
+            if "flee" in reason.lower() or "evacuat" in reason.lower():
+                self.logger.flee(state.region_name, to_name, reason)
+            else:
+                self.logger.move(state.region_name, to_name, reason)
         elif action_type == "explore":
             self.logger.explore(state.region_name)
         elif action_type == "rest":

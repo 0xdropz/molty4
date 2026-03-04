@@ -6,10 +6,10 @@ All constants, thresholds, blacklists in one place.
 import re
 
 # ─── Friendly Detection ──────────────────────────────
-# Matches: "godmode1", "begal99", "pakrt01", etc.
-# Rejects: "godslayer", "begalPro" (must end with numbers)
+# Matches qq-series bots only. Prefix pendek (begal, godmode, dll) dihapus — sultan version.
+# Rejects: anyone not in qq-series (treated as enemy / sultan target)
 IS_FRIENDLY_REGEX = re.compile(
-    r"^(godmode|godslay|godhunt|godsquad|begal|maling|koruptor|kangtipu|pakkades|pakrt|qqrxqqrxqqrxqqrxqqrxqqrxqqrxqq|qqtsqqtsqqtsqqtsqqtsqqtsqqtsqq|qqvtqqvtqqvtqqvtqqvtqqvtqqvtqq|qqxxqqxxqqxxqqxxqqxxqqxxqqxxqq|qqssqqssqqssqqssqqssqqssqqssqq)\d+$",
+    r"^(qqrxqqrxqqrxqqrxqqrxqqrxqqrxqq|qqtsqqtsqqtsqqtsqqtsqqtsqqtsqq|qqvtqqvtqqvtqqvtqqvtqqvtqqvtqq|qqxxqqxxqqxxqqxxqqxxqqxxqqxxqq|qqssqqssqqssqqssqqssqqssqqssqq)\d+$",
     re.IGNORECASE,
 )
 
@@ -22,7 +22,7 @@ API_TIMEOUT = 20  # HTTP request timeout seconds (lowered for faster fail)
 API_RETRIES = 4  # max retry on failure (increased for laggy server)
 
 # ─── Item Rules ──────────────────────────────────────
-ITEM_BLACKLIST = {"Map", "Radio", "Megaphone", "Binoculars"}  # never pickup
+ITEM_BLACKLIST = {"Map", "Radio", "Megaphone"}  # never pickup
 MAX_WEAPONS_IN_INVENTORY = 4  # Strict cap: 4 weapons
 MAX_HEALS_IN_INVENTORY = 5  # Strict cap: 5 healing items
 MAX_INVENTORY = 10
@@ -43,19 +43,6 @@ WEAPON_PRIORITY = {
 WEAPON_TYPE_MELEE = {"Fist", "Dagger", "Sword", "Katana"}
 WEAPON_TYPE_RANGED = {"Bow", "Pistol", "Sniper rifle"}
 
-# ─── Loot Tiers (Preventive Inventory) ───────────────
-LOOT_TIER_S = {"Katana", "Sniper rifle", "medkit", "Moltz"}  # Always pickup
-LOOT_TIER_A = {"Sword", "Pistol", "Bandage", "Bow"}  # Pickup if slots > 2
-LOOT_TIER_B = {
-    "Dagger",
-    "Emergency rations",
-    "Energy drink",
-}  # Pickup only if desperate
-
-# Thresholds: Removed per user request (Fill until full)
-# THRESHOLD_TIER_A = 8
-# THRESHOLD_TIER_B = 5
-
 # --- HP / EP Thresholds ---
 LOW_HP = 60  # start healing (lower = more aggressive)
 CRITICAL_HP = 40  # emergency heal, override everything
@@ -63,7 +50,11 @@ MIN_EP_ATTACK = 2  # need 2 EP to attack
 MIN_EP_ACTION = 1  # need 1 EP for any group-1 action
 
 # --- Combat ---
-KILL_STEAL_HP = 40  # prioritize targets below this HP (aggressive)
+KILL_STEAL_HP = 50  # prioritize targets below this HP — also used as Vulture threshold
+SULTAN_THRESHOLD = (
+    30  # min Moltz in enemy inventory to be considered a sultan target (reserved)
+)
+KILLER_THRESHOLD = 2  # min kills to be considered a killer target (reserved)
 
 # ─── Monster Priority (higher = fight first) ─────────
 MONSTER_PRIORITY = {

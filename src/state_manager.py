@@ -148,7 +148,9 @@ class RegionInfo:
             vision_modifier=d.get("visionModifier", 0),
             is_death_zone=d.get("isDeathZone", False),
             connections=d.get("connections", []),
-            interactables=[Interactable.from_dict(i) for i in d.get("interactables", [])],
+            interactables=[
+                Interactable.from_dict(i) for i in d.get("interactables", [])
+            ],
         )
 
 
@@ -192,6 +194,7 @@ class SelfInfo:
 @dataclass
 class GameState:
     """Parsed game state from API response."""
+
     self_info: SelfInfo | None = None
     current_region: RegionInfo | None = None
     connected_regions: list[RegionInfo] = field(default_factory=list)
@@ -199,6 +202,9 @@ class GameState:
     visible_monsters: list[MonsterInfo] = field(default_factory=list)
     visible_items: list[RegionItem] = field(default_factory=list)
     visible_regions: list[RegionInfo] = field(default_factory=list)
+    raw_visible_agents: list[dict] = field(
+        default_factory=list
+    )  # raw API dicts (has inventory)
     pending_deathzones: list[dict] = field(default_factory=list)
     game_status: str = "waiting"  # waiting, running, finished
     result: dict = field(default_factory=dict)
@@ -240,10 +246,17 @@ class GameState:
             self_info=SelfInfo.from_dict(d.get("self", {})),
             current_region=RegionInfo.from_dict(d.get("currentRegion", {})),
             connected_regions=connected,
-            visible_enemies=[EnemyInfo.from_dict(a) for a in d.get("visibleAgents", [])],
-            visible_monsters=[MonsterInfo.from_dict(m) for m in d.get("visibleMonsters", [])],
+            visible_enemies=[
+                EnemyInfo.from_dict(a) for a in d.get("visibleAgents", [])
+            ],
+            visible_monsters=[
+                MonsterInfo.from_dict(m) for m in d.get("visibleMonsters", [])
+            ],
             visible_items=[RegionItem.from_dict(i) for i in d.get("visibleItems", [])],
-            visible_regions=[RegionInfo.from_dict(r) for r in d.get("visibleRegions", [])],
+            visible_regions=[
+                RegionInfo.from_dict(r) for r in d.get("visibleRegions", [])
+            ],
+            raw_visible_agents=d.get("visibleAgents", []),
             pending_deathzones=d.get("pendingDeathzones", []),
             game_status=d.get("gameStatus", "waiting"),
             result=d.get("result") or {},
