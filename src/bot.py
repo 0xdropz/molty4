@@ -1,10 +1,10 @@
 """
 bot.py — Single bot game loop.
-Handles: join game -> recover stuck accounts -> wait -> turn loop -> reincarnate.
+Handles: wait for joiner assignment -> recover if needed -> wait for start -> turn loop -> reincarnate via rejoin_queue.
+Join logic is fully delegated to joiner.py.
 """
 
 import asyncio
-import random
 import time
 from src.api_client import ApiClient
 from src.state_manager import GameState
@@ -49,7 +49,11 @@ class MoltyBot:
         all_api_keys: list[str],
         all_bot_ids: set = None,
         god_cache=None,
+        game_id: str = "",
+        agent_id: str = "",
+        rejoin_queue: asyncio.Queue = None,
     ):
+        self.account = account
         self.name = account["name"]
         self.api_key = account["apiKey"]
         self.account_id = account.get("accountId", "")
@@ -58,45 +62,66 @@ class MoltyBot:
         self.api = ApiClient(self.api_key, bot_index=bot_index)
         self.logger = BotLogger(self.name, bot_index)
         self.intel = GodModeIntel()
-        self.god_cache = god_cache  # shared god mode cache
+        self.god_cache = god_cache
 
-        self.game_id = ""
-        self.agent_id = ""
+        self.game_id = game_id
+        self.agent_id = agent_id
         self.all_bot_ids = all_bot_ids or set()
         self.turn_count = 0
-        self._last_state: GameState | None = None  # fallback for rate-limited state
+        self._last_state: GameState | None = None
+
+        # Joiner signals this event when it assigns a new game after reincarnation
+        self._ready_event: asyncio.Event = asyncio.Event()
+        if game_id:
+            self._ready_event.set()  # already assigned at startup
+
+        # Queue to request a new game from joiner after reincarnation
+        self.rejoin_queue: asyncio.Queue = rejoin_queue or asyncio.Queue()
+
         self._running = True
 
     async def run(self):
-        """Full bot lifecycle with reincarnation loop."""
+        """Full bot lifecycle with reincarnation loop. Join is fully handled by joiner."""
         try:
             while self._running:
-                # 1. Find/join/recover game
-                joined = await self._join_or_recover()
-                if not joined:
-                    self.logger.warn("Could not join any game. Retrying in 3s...")
-                    await asyncio.sleep(3)
+                # 1. Wait for joiner to assign a game (initial or after reincarnation)
+                await self._ready_event.wait()
+
+                if not self._running:
+                    break
+
+                # 2. If ALREADY_IN_GAME case: agent_id is empty, recover first
+                if self.game_id and not self.agent_id:
+                    self.logger.info("No agent_id — recovering...")
+                    recovered = await self._recover_existing_game()
+                    if not recovered:
+                        self.logger.warn("Recovery failed. Requeuing...")
+                        await self._request_rejoin()
+                        continue
+
+                if not self.game_id or not self.agent_id:
+                    self.logger.warn("No game assigned. Requeuing...")
+                    await self._request_rejoin()
                     continue
 
-                # 2. Wait for game to start
+                self.logger.info(
+                    f"game={self.game_id[:8]}.. agent={self.agent_id[:12]}.."
+                )
+
+                # 3. Wait for game to start
                 started = await self._wait_for_start()
                 if not started:
-                    self.logger.warn("Game start timeout. Leaving room...")
-                    self.game_id = ""
-                    self.agent_id = ""
-                    await asyncio.sleep(5)
+                    self.logger.warn("Game start timeout. Requeuing...")
+                    await self._request_rejoin()
                     continue
 
-                # 3. Main game loop
+                # 4. Main game loop
                 await self._game_loop()
 
-                # 4. Game ended -- reincarnate
+                # 5. Game ended — reincarnate via joiner
                 if self._running:
-                    self.logger.info("Game ended. Waiting 10s before next game...")
-                    self.game_id = ""
-                    self.agent_id = ""
-                    self.turn_count = 0
-                    await asyncio.sleep(10)
+                    self.logger.info("Game ended. Requeuing...")
+                    await self._request_rejoin()
 
         except asyncio.CancelledError:
             self.logger.shutdown()
@@ -108,231 +133,61 @@ class MoltyBot:
         finally:
             await self.api.close()
 
+    async def _request_rejoin(self):
+        """Clear state and signal joiner to assign a new game."""
+        self.game_id = ""
+        self.agent_id = ""
+        self.turn_count = 0
+        self._ready_event.clear()
+        await self.rejoin_queue.put(self.account)
+
     async def stop(self):
         self._running = False
+        self._ready_event.set()  # unblock wait() so run() can exit cleanly
 
-    # --- Join / Recover ---
-
-    async def _join_or_recover(self) -> bool:
-        """
-        Flow:
-        1. Try to join a waiting game immediately. (Fastest approach)
-        2. If join fails because account is already in a game, extract game ID and recover.
-        3. If no waiting games, do a quick recovery scan. If not stuck, poll for new waiting games.
-        """
-        # Step 1: Look for waiting game immediately
-        self.logger.info("Looking for a waiting game to join...")
-        games_resp = await self.api.find_games("waiting")
-        games = self._extract_games(games_resp)
-
-        # Filter free games only and ensure they are not fully packed yet
-        free_games = [
-            g
-            for g in games
-            if g.get("entryType") == "free"
-            and g.get("agentCount", 0) < g.get("maxAgents", 100)
-        ]
-
-        if free_games:
-            # Sort games by current agents (highest first, so we join games about to start)
-            free_games.sort(key=lambda g: g.get("agentCount", 0), reverse=True)
-
-            # Shotgun Join: Try games one by one instantly if full
-            for game in free_games:
-                game_id = game.get("id", "")
-                game_name = game.get("name", game_id)
-                self.logger.info(
-                    f'Found waiting free game: "{game_name}" ({game_id[:8]}...) - Agents: {game.get("agentCount")}/{game.get("maxAgents", 100)}'
-                )
-
-                result = await self._try_register(game_id, game_name)
-
-                if result == "ok":
-                    return True
-                elif result == "recover":
-                    # Account stuck — try fast-track recover
-                    return await self._recover_existing_game()
-                # If result == "fail" (e.g. MAX_AGENTS_REACHED), loop continues to next game immediately
-
-        else:
-            self.logger.warn("No free waiting games with empty slots available.")
-
-        # Step 2: If we failed to join any or none exist, maybe we are stuck in a RUNNING game.
-        # Let's do a full scan JUST IN CASE we disconnected.
-        recovered = await self._recover_existing_game()
-        if recovered:
-            return True
-
-        # Step 3: If we are completely free (not in any game), instead of exiting and waiting 3 seconds
-        # in the main loop, we will enter an aggressive polling loop to snipe new games.
-        self.logger.info("Bot is free. Polling for a new game...")
-
-        # Jitter start to prevent all bots from polling at the exact same millisecond (Thundering Herd)
-        await asyncio.sleep(random.uniform(0.5, 2.0))
-
-        for _ in range(15):  # Poll before returning False to reset connection
-            if not self._running:
-                return False
-
-            # Wait 4-7 seconds between checks to avoid Cloudflare 502/429 blocks
-            await asyncio.sleep(random.uniform(4.0, 7.0))
-
-            games_resp = await self.api.find_games("waiting")
-
-            if is_api_error(games_resp):
-                msg, code = get_error_info(games_resp)
-                if code in ("HTTP_502", "HTTP_429", "RATE_LIMIT_EXCEEDED"):
-                    self.logger.warn(
-                        f"Server anti-spam triggered ({code}). Cooling down..."
-                    )
-                    await asyncio.sleep(15)
-                    return False  # Escape polling loop to cooldown safely
-                continue
-
-            games = self._extract_games(games_resp)
-            fresh_games = [
-                g
-                for g in games
-                if g.get("entryType") == "free"
-                and g.get("agentCount", 0) < g.get("maxAgents", 100)
-            ]
-
-            if fresh_games:
-                self.logger.info("New game detected! Sniping slot...")
-                # Exit polling loop and let the main run() loop restart the process
-                # which will immediately catch it in Step 1.
-                return False
-
-        return False
-
-    def _extract_games(self, resp: dict) -> list:
-        """Extract games list from various response formats."""
-        if not resp:
-            return []
-        # Format: {success: true, data: [...]}
-        data = resp.get("data", [])
-        if isinstance(data, list):
-            return data
-        # Format: {data: {games: [...]}}
-        if isinstance(data, dict):
-            return data.get("games", [])
-        # Format: bare list (shouldn't happen with our api_client)
-        if isinstance(resp, list):
-            return resp
-        return []
-
-    def _extract_game_id_from_error(self, error_msg: str) -> str:
-        """Try to extract a game ID (UUID) from an error message."""
-        import re
-
-        match = re.search(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", error_msg
-        )
-        return match.group(0) if match else ""
-
-    async def _try_register(self, game_id: str, game_name: str) -> str:
-        """
-        Try to register in a game.
-        Returns: "ok", "recover", or "fail"
-        """
-        if not game_id:
-            return "fail"
-
-        self.logger.info(f'Registering in "{game_name}"...')
-        reg = await self.api.register_agent(game_id, self.name)
-
-        if not is_api_error(reg):
-            # Success - extract agent data
-            agent_data = reg.get("data", reg)
-            if isinstance(agent_data, dict) and "id" in agent_data:
-                self.game_id = game_id
-                self.agent_id = agent_data["id"]
-            elif isinstance(agent_data, dict) and "self" in agent_data:
-                self.game_id = game_id
-                self.agent_id = agent_data["self"].get("id", "")
-            else:
-                # Try to find our ID from the response
-                self.game_id = game_id
-                self.agent_id = str(agent_data.get("id", agent_data.get("agentId", "")))
-
-            if self.agent_id:
-                self.all_bot_ids.add(self.agent_id)
-                self.logger.startup(game_name, self.name)
-                self.logger.info(f"Agent ID: {self.agent_id}")
-                return "ok"
-            else:
-                self.logger.warn(f"Registered but no agent ID in response: {reg}")
-                return "fail"
-
-        msg, code = get_error_info(reg)
-        self.logger.warn(f"Register failed: {msg} ({code})")
-
-        if code == "ACCOUNT_ALREADY_IN_GAME":
-            # Extract the Game ID directly from the message if possible
-            # Message example: "Account is already in another game (waiting or running). Only one game per account at a time. Current game: be6a46a7-6d96-47f0-b716-154fa47ea08e"
-            extracted_game_id = self._extract_game_id_from_error(msg)
-            if extracted_game_id:
-                self.logger.info(f"Extracted Game ID from error: {extracted_game_id}")
-                # Save it so _recover_existing_game can prioritize it
-                self._stuck_game_id = extracted_game_id
-            return "recover"
-
-        if code == "ONE_AGENT_PER_API_KEY":
-            return "recover"
-
-        if code in ("MAX_AGENTS_REACHED", "GAME_ALREADY_STARTED"):
-            return "fail"
-        return "fail"
+    # --- Recover (for ALREADY_IN_GAME case only) ---
 
     async def _recover_existing_game(self) -> bool:
         """
-        Recover agent ID when account is already in a game.
+        Recover agent ID when joiner signals ALREADY_IN_GAME (game_id known, agent_id empty).
         Uses God Mode to find our agent by accountId (fallback to name).
         """
+        stuck_id = self.game_id
+        if not stuck_id:
+            self.logger.warn("No game_id to recover from.")
+            return False
 
-        # 1. Fast Track: If we extracted the game ID from the error message
-        stuck_id = getattr(self, "_stuck_game_id", None)
-        if stuck_id:
-            self.logger.info(f"Fast-track recovery for game: {stuck_id}")
-            success = await self._check_game_for_recovery(stuck_id)
-            if success:
-                self._stuck_game_id = None  # Clear it
-                return True
-            else:
-                self.logger.warn(f"Fast-track recovery failed. Cannot recover.")
-                self._stuck_game_id = None  # Clear it
-                return False
+        self.logger.info(f"Recovering from game: {stuck_id[:8]}..")
+        success = await self._check_game_for_recovery(stuck_id)
+        if success:
+            return True
 
-        self.logger.warn("No fast-track game ID available to recover.")
+        self.logger.warn("Recovery failed.")
         return False
 
     async def _check_game_for_recovery(self, gid: str, gname: str = None) -> bool:
-        """Helper to check a specific game ID for our agent"""
+        """Helper: use God Mode to find our agent in a specific game."""
         if not gname:
             gname = gid
 
-        # Try God Mode to find our agent
         full_state = await self.api.get_full_state(gid)
         if is_api_error(full_state):
             msg, code = get_error_info(full_state)
             if code == "RATE_LIMIT_EXCEEDED":
-                self.logger.warn(f"Rate limited during recovery scan. Sleeping 5s...")
+                self.logger.warn("Rate limited during recovery. Sleeping 5s...")
                 await asyncio.sleep(5)
             return False
 
-        # God Mode response might be wrapped or unwrapped
         data = full_state.get("data", full_state)
         agents = data.get("agents", [])
 
         for agent in agents:
             agent_account_id = agent.get("accountId", "")
-
-            # Compare by accountId if available, fallback to name
-            is_match = False
-            if self.account_id and agent_account_id:
-                is_match = agent_account_id == self.account_id
-            else:
-                is_match = agent.get("name", "") == self.name
+            is_match = (
+                agent_account_id == self.account_id
+                if (self.account_id and agent_account_id)
+                else agent.get("name", "") == self.name
+            )
 
             if is_match:
                 self.game_id = gid
@@ -348,7 +203,6 @@ class MoltyBot:
                     if not is_api_error(game_resp):
                         status = game_resp.get("data", game_resp).get("status", "")
 
-                # If the game hasn't started yet, agents might be flagged as dead/unspawned
                 if is_alive or status == "waiting":
                     self.logger.info(
                         f'Recovered! Game: "{gname}", Agent: "{self.name}" (HP:{hp}, Status:{status})'
@@ -356,10 +210,10 @@ class MoltyBot:
                     return True
                 else:
                     self.logger.info(
-                        f'Found in "{gname}" but DEAD. Leaving game to register new one...'
+                        f'Found in "{gname}" but DEAD. Requesting rejoin...'
                     )
-                    # Don't wait 2.7 hours, just return False to retry joining a new game
                     return False
+
         return False
 
     # --- Wait for Start ---
@@ -379,7 +233,7 @@ class MoltyBot:
 
             if is_api_error(game_resp):
                 msg, code = get_error_info(game_resp)
-                self.logger.warn(f"Game poll error: {msg} ({code})")
+                self.logger.warn(f"Game poll error: {code}")
                 await asyncio.sleep(15)
                 attempts += 1
                 continue
@@ -396,7 +250,7 @@ class MoltyBot:
 
             count = data.get("agentCount", data.get("currentAgents", "?"))
             max_a = data.get("maxAgents", "?")
-            self.logger.info(f"Waiting... ({count}/{max_a} agents)")
+            self.logger.info(f"Waiting... ({count}/{max_a})")
 
             await asyncio.sleep(15)
             attempts += 1
@@ -431,8 +285,7 @@ class MoltyBot:
                 if isinstance(state_resp, Exception):
                     self.logger.error(f"State exception: {state_resp}")
                     if self._last_state:
-                        self.logger.info("Using last known state (fallback)")
-                        state_resp = None  # flag to use fallback below
+                        state_resp = None
                     else:
                         await asyncio.sleep(TURN_INTERVAL)
                         continue
@@ -440,10 +293,8 @@ class MoltyBot:
                 if state_resp is not None and is_api_error(state_resp):
                     msg, code = get_error_info(state_resp)
 
-                    if code == "RATE_LIMIT_EXCEEDED":
-                        self.logger.warn("State Rate Limited (using fallback)")
-                    else:
-                        self.logger.error(f"State failed: {msg} ({code})")
+                    if code != "RATE_LIMIT_EXCEEDED":
+                        self.logger.error(f"State failed: {code}")
 
                     if code in (
                         "AGENT_NOT_FOUND",
@@ -454,8 +305,7 @@ class MoltyBot:
                         break
 
                     if self._last_state:
-                        self.logger.info("Using last known state (fallback)")
-                        state_resp = None  # flag to use fallback below
+                        state_resp = None
                     else:
                         await asyncio.sleep(TURN_INTERVAL)
                         continue
@@ -470,8 +320,7 @@ class MoltyBot:
                 # Check death
                 if not state.is_alive:
                     self.logger.death()
-                    self.logger.info(f"Final stats: kills={state.kills}")
-                    # Reincarnate immediately instead of waiting for game to finish
+                    self.logger.info(f"Kills: {state.kills}")
                     break
 
                 # Check game finished
@@ -511,55 +360,22 @@ class MoltyBot:
                     is_death_zone=state.is_death_zone,
                 )
 
-                # ── Step 2: Process god mode result (already fetched in parallel) ──
-                god_mode_ok = False
+                # ── Step 2: Process god mode result ──
                 if isinstance(full_state_resp, Exception):
                     self.intel.available = False
-                    self.logger.godmode(f"Error: {full_state_resp}")
                 else:
                     try:
                         self.intel.update(full_state_resp)
-                        if self.intel.available:
-                            _own_ids_gm = self.all_bot_ids | {state.self_info.id}
-                            _is_purge_gm = len(self.intel.all_agents) > 0 and not any(
-                                a.get("isAlive")
-                                and a.get("id") not in _own_ids_gm
-                                and not IS_FRIENDLY_REGEX.match(a.get("name", ""))
-                                for a in self.intel.all_agents
-                            )
-                            weak = self.intel.find_weak_enemies(
-                                is_purge_time=_is_purge_gm
-                            )
-                            weapons = self.intel.find_high_value_weapons()
-                            moltz = self.intel.find_moltz_locations()
-                            alive_count = sum(
-                                1 for a in self.intel.all_agents if a.get("isAlive")
-                            )
-                            self.logger.godmode(
-                                f"Map: {alive_count} agents, "
-                                f"{len(weak)} weak, "
-                                f"{len(weapons)} weapons, "
-                                f"{len(moltz)} moltz"
-                            )
-                            god_mode_ok = True
-                        else:
-                            self.logger.godmode("Failed -- using normal vision")
-                    except Exception as e:
+                    except Exception:
                         self.intel.available = False
-                        self.logger.godmode(f"Error: {e}")
 
-                # ── Step 4: FREE actions — pickup THEN equip (sequential: equip needs updated inventory) ──
+                # ── Step 4: FREE actions — pickup then equip ──
                 await pickup_all_valuable(
                     state, self.api, self.game_id, self.agent_id, self.logger, retries=1
                 )
 
-                # Check for smart swap based on best target
                 _pending_ids = {dz.get("id", "") for dz in state.pending_deathzones}
                 _own_ids = self.all_bot_ids | {state.self_info.id}
-                # _is_purge = True hanya jika:
-                # 1. God View aktif dan ada data
-                # 2. Ada minimal 1 agent NON-own yang hidup di map (guard early game)
-                # 3. Semua agent non-own yang hidup adalah friendly (tidak ada musuh publik)
                 _non_own_alive = [
                     a
                     for a in self.intel.all_agents
@@ -632,24 +448,13 @@ class MoltyBot:
                     "plannedAction": clean_action.get("type", "rest"),
                 }
 
-                # Log use_item attempt for clarity
-                if clean_action.get("type") == "use_item":
-                    item_id = clean_action.get("itemId", "")
-                    item_name = "Unknown Item"
-                    for i in state.inventory:
-                        if i.id == item_id:
-                            item_name = i.name
-                            break
-                    self.logger.info(f'Attempting to use: "{item_name}"...')
-
                 result = await self.api.do_action(
                     self.game_id, self.agent_id, clean_action, thought, retries=2
                 )
 
                 if is_api_error(result):
                     msg, code = get_error_info(result)
-                    self.logger.warn(f"Action failed: {msg} ({code})")
-                    # Cooldown not expired? Short wait and retry
+                    self.logger.warn(f"Action failed: {code}")
                     if "cooldown" in msg.lower() or "wait" in msg.lower():
                         await asyncio.sleep(5)
 

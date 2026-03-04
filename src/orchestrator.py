@@ -1,18 +1,17 @@
 """
 orchestrator.py — Multi-bot async launcher with graceful shutdown.
-Staggered registration, shared state, reincarnation.
+Joiner runs persistently alongside bots. Bots launch as soon as joiner assigns them a game.
+After each game ends, bots signal joiner via rejoin_queue to get a new game.
 """
 
 import asyncio
 import signal
 import json
 import os
-import traceback
-import sys
 
 from src.bot import MoltyBot
-from src.logger import BotLogger
 from src.god_mode_cache import GodModeCache
+from src.joiner import run_joiner
 
 
 class Orchestrator:
@@ -23,21 +22,24 @@ class Orchestrator:
         self.bot_index = bot_index  # None = all bots
         self.bots: list[MoltyBot] = []
         self.shared_bot_ids: set = set()
-        self.god_cache = GodModeCache(ttl=30.0)  # shared across all bots
+        self.god_cache = GodModeCache(ttl=30.0)
         self._tasks: list[asyncio.Task] = []
 
+        # Shared queue: bots push their account here when they need a new game
+        self._rejoin_queue: asyncio.Queue = asyncio.Queue()
+
+        # Map account name → MoltyBot for joiner callback
+        self._bot_map: dict[str, MoltyBot] = {}
+
     def _load_accounts(self, path: str) -> list[dict]:
-        """Load accounts from JSON file."""
         abs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
         if not os.path.exists(abs_path):
             abs_path = path
-
         with open(abs_path, "r") as f:
             return json.load(f)
 
     async def run(self):
-        """Run bots with staggered registration and graceful shutdown."""
-        # Determine which accounts to use
+        """Run persistent joiner + bots concurrently. Bots launch as joiner assigns them."""
         if self.bot_index is not None:
             if isinstance(self.bot_index, int):
                 if 0 <= self.bot_index < len(self.accounts):
@@ -67,10 +69,9 @@ class Orchestrator:
         print(f"{'=' * 60}")
         print()
 
-        # Build friendly bot names set (prevent friendly fire)
         self.shared_bot_ids = {acc["name"] for acc in self.accounts}
 
-        # Create bots
+        # Pre-create all bots — no game_id/agent_id yet, joiner will assign
         for idx, account in selected:
             bot = MoltyBot(
                 account=account,
@@ -78,8 +79,10 @@ class Orchestrator:
                 all_api_keys=all_keys,
                 all_bot_ids=self.shared_bot_ids,
                 god_cache=self.god_cache,
+                rejoin_queue=self._rejoin_queue,
             )
             self.bots.append(bot)
+            self._bot_map[account["name"]] = bot
 
         # Setup signal handlers
         loop = asyncio.get_event_loop()
@@ -89,12 +92,19 @@ class Orchestrator:
             except NotImplementedError:
                 pass  # Windows
 
-        # Launch all bots immediately — no stagger delay
-        self._tasks = []
-        for i, bot in enumerate(self.bots):
-            task = asyncio.create_task(bot.run(), name=f"bot_{bot.name}")
-            self._tasks.append(task)
+        # ── Launch persistent joiner as background task ──
+        # Joiner never stops — it handles initial join + all reincarnations
+        joiner_task = asyncio.create_task(
+            run_joiner(
+                [acc for _, acc in selected],
+                self._on_bot_ready,
+                self._rejoin_queue,
+            ),
+            name="joiner",
+        )
+        self._tasks.append(joiner_task)
 
+        # Bot tasks are created dynamically in _on_bot_ready as joiner assigns games
         try:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         except asyncio.CancelledError:
@@ -107,21 +117,38 @@ class Orchestrator:
         print(f"  All bots exited.")
         print(f"{'=' * 60}")
 
+    async def _on_bot_ready(self, account: dict, game_id: str, agent_id: str):
+        """
+        Called by joiner when an account is assigned to a game.
+        Injects game_id/agent_id into bot and fires _ready_event.
+        If bot task not yet running, creates it now.
+        """
+        name = account["name"]
+        bot = self._bot_map.get(name)
+        if bot is None:
+            return
+
+        # Inject game assignment
+        bot.game_id = game_id
+        bot.agent_id = agent_id
+        bot._ready_event.set()
+
+        # Launch bot task if not already running
+        existing = next((t for t in self._tasks if t.get_name() == f"bot_{name}"), None)
+        if existing is None or existing.done():
+            task = asyncio.create_task(bot.run(), name=f"bot_{name}")
+            self._tasks.append(task)
+
     def _handle_signal(self):
         """Handle Ctrl+C / SIGTERM."""
         print("\n\nShutdown signal received...")
-
-        # 1. Tell all bots to stop their internal loops
         for bot in self.bots:
             asyncio.create_task(bot.stop())
-
-        # 2. Give the loops a moment to finish gracefully and run finally blocks
-        # We don't instantly cancel tasks, let them exit naturally first
         loop = asyncio.get_event_loop()
         loop.create_task(self._force_cancel_after_delay())
 
     async def _force_cancel_after_delay(self):
-        """If bots don't exit cleanly within 3 seconds, forcefully cancel them."""
+        """Force cancel all tasks after 3 seconds if they haven't exited cleanly."""
         await asyncio.sleep(3.0)
         for task in self._tasks:
             if not task.done():

@@ -9,7 +9,7 @@ import re
 # Matches: "godmode1", "begal99", "pakrt01", etc.
 # Rejects: "godslayer", "begalPro" (must end with numbers)
 IS_FRIENDLY_REGEX = re.compile(
-    r"^(godmode|godslay|godhunt|godsquad|begal|maling|koruptor|kangtipu|pakkades|pakrt)\d+$",
+    r"^(godmode|godslay|godhunt|godsquad|begal|maling|koruptor|kangtipu|pakkades|pakrt|qqrxqqrxqqrxqqrxqqrxqqrxqqrxqq|qqtsqqtsqqtsqqtsqqtsqqtsqqtsqq|qqvtqqvtqqvtqqvtqqvtqqvtqqvtqq|qqxxqqxxqqxxqqxxqqxxqqxxqqxxqq|qqssqqssqqssqqssqqssqqssqqssqq)\d+$",
     re.IGNORECASE,
 )
 
@@ -63,7 +63,11 @@ MIN_EP_ATTACK = 2  # need 2 EP to attack
 MIN_EP_ACTION = 1  # need 1 EP for any group-1 action
 
 # --- Combat ---
-KILL_STEAL_HP = 40  # prioritize targets below this HP (aggressive)
+KILL_STEAL_HP = 50  # prioritize targets below this HP — also used as Vulture threshold
+SULTAN_THRESHOLD = (
+    30  # min Moltz in enemy inventory to be considered a sultan target (reserved)
+)
+KILLER_THRESHOLD = 2  # min kills to be considered a killer target (reserved)
 
 # ─── Monster Priority (higher = fight first) ─────────
 MONSTER_PRIORITY = {
