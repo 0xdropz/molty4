@@ -86,14 +86,15 @@ class MoltyBot:
                 if not self._running:
                     break
 
-                # 2. If ALREADY_IN_GAME case: agent_id is empty, recover first
+                # 2. If ALREADY_IN_GAME case: agent_id is empty.
+                # Because we can't get agent_id without God Mode, we just wait for the game to end.
                 if self.game_id and not self.agent_id:
-                    self.logger.info("No agent_id — recovering...")
-                    recovered = await self._recover_existing_game()
-                    if not recovered:
-                        self.logger.warn("Recovery failed. Requeuing...")
-                        await self._request_rejoin()
-                        continue
+                    self.logger.warn(
+                        f"Stuck in running game. Waiting for {self.game_id[:8]} to end..."
+                    )
+                    await self._wait_for_game_to_finish(self.game_id)
+                    await self._request_rejoin()
+                    continue
 
                 if not self.game_id or not self.agent_id:
                     self.logger.warn("No game assigned. Requeuing...")
@@ -141,76 +142,39 @@ class MoltyBot:
         self._running = False
         self._ready_event.set()  # unblock wait() so run() can exit cleanly
 
-    # --- Recover (for ALREADY_IN_GAME case only) ---
+    # --- Waiting for Game to Finish (Silent Polling) ---
 
-    async def _recover_existing_game(self) -> bool:
+    async def _wait_for_game_to_finish(self, game_id: str):
         """
-        Recover agent ID when joiner signals ALREADY_IN_GAME (game_id known, agent_id empty).
-        Uses God Mode to find our agent by accountId (fallback to name).
+        Polls game status silently every 15s until 'finished'.
+        Used when bot dies or gets ALREADY_IN_GAME (stuck) to prevent spam.
         """
-        stuck_id = self.game_id
-        if not stuck_id:
-            self.logger.warn("No game_id to recover from.")
-            return False
+        if not game_id:
+            return
 
-        self.logger.info(f"Recovering from game: {stuck_id[:8]}..")
-        success = await self._check_game_for_recovery(stuck_id)
-        if success:
-            return True
+        self.logger.info(f"Waiting silently for game {game_id[:8]} to finish...")
 
-        self.logger.warn("Recovery failed.")
-        return False
+        while self._running:
+            # Random jitter to prevent thunderherd from 50 dead bots
+            jitter = (self.bot_index % 100) * 0.1
+            await asyncio.sleep(15 + jitter)
 
-    async def _check_game_for_recovery(self, gid: str, gname: str = None) -> bool:
-        """Helper: use God Mode to find our agent in a specific game."""
-        if not gname:
-            gname = gid
+            game_resp = await self.api.get_game_info(game_id)
 
-        full_state = await self.api.get_full_state(gid)
-        if is_api_error(full_state):
-            msg, code = get_error_info(full_state)
-            if code == "RATE_LIMIT_EXCEEDED":
-                self.logger.warn("Rate limited during recovery. Sleeping 5s...")
-                await asyncio.sleep(5)
-            return False
+            # If error, ignore and keep waiting (silent)
+            if is_api_error(game_resp):
+                msg, code = get_error_info(game_resp)
+                if code == "GAME_NOT_FOUND":
+                    self.logger.info("Game no longer exists on server. Free to join.")
+                    break
+                continue
 
-        data = full_state.get("data", full_state)
-        agents = data.get("agents", [])
+            data = game_resp.get("data", game_resp)
+            status = data.get("status", "")
 
-        for agent in agents:
-            agent_account_id = agent.get("accountId", "")
-            is_match = (
-                agent_account_id == self.account_id
-                if (self.account_id and agent_account_id)
-                else agent.get("name", "") == self.name
-            )
-
-            if is_match:
-                self.game_id = gid
-                self.agent_id = agent.get("id", "")
-                self.all_bot_ids.add(self.agent_id)
-
-                is_alive = agent.get("isAlive", True)
-                hp = agent.get("hp", 0)
-                status = data.get("status", "")
-
-                if not status:
-                    game_resp = await self.api.get_game_info(gid)
-                    if not is_api_error(game_resp):
-                        status = game_resp.get("data", game_resp).get("status", "")
-
-                if is_alive or status == "waiting":
-                    self.logger.info(
-                        f'Recovered! Game: "{gname}", Agent: "{self.name}" (HP:{hp}, Status:{status})'
-                    )
-                    return True
-                else:
-                    self.logger.info(
-                        f'Found in "{gname}" but DEAD. Requesting rejoin...'
-                    )
-                    return False
-
-        return False
+            if status == "finished":
+                self.logger.info("Game finally finished. Free to join new game.")
+                break
 
     # --- Wait for Start ---
 
@@ -322,6 +286,7 @@ class MoltyBot:
                 if not state.is_alive:
                     self.logger.death()
                     self.logger.info(f"Kills: {state.kills}")
+                    await self._wait_for_game_to_finish(self.game_id)
                     break
 
                 # Check game finished
