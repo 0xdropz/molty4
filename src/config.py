@@ -63,11 +63,7 @@ MIN_EP_ATTACK = 2  # need 2 EP to attack
 MIN_EP_ACTION = 1  # need 1 EP for any group-1 action
 
 # --- Combat ---
-KILL_STEAL_HP = 50  # prioritize targets below this HP — also used as Vulture threshold
-SULTAN_THRESHOLD = (
-    30  # min Moltz in enemy inventory to be considered a sultan target (reserved)
-)
-KILLER_THRESHOLD = 2  # min kills to be considered a killer target (reserved)
+KILL_STEAL_HP = 40  # prioritize targets below this HP (aggressive)
 
 # ─── Monster Priority (higher = fight first) ─────────
 MONSTER_PRIORITY = {
