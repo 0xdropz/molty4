@@ -9,7 +9,7 @@ import re
 # Matches qq-series bots only. Prefix pendek (begal, godmode, dll) dihapus — sultan version.
 # Rejects: anyone not in qq-series (treated as enemy / sultan target)
 IS_FRIENDLY_REGEX = re.compile(
-    r"^(godhunt|godsquad|begal|qqrxqqrxqqrxqqrxqqrxqqrxqqrxqq|qqtsqqtsqqtsqqtsqqtsqqtsqqtsqq|qqvtqqvtqqvtqqvtqqvtqqvtqqvtqq|qqxxqqxxqqxxqqxxqqxxqqxxqqxxqq|qqssqqssqqssqqssqqssqqssqqssqq)\d+$",
+    r"^(godhunt|godsquad|begal|godmode|godslay|koruptor|kangtipu|pakkades|pakrt|maling|qqrxqqrxqqrxqqrxqqrxqqrxqqrxqq|qqtsqqtsqqtsqqtsqqtsqqtsqqtsqq|qqvtqqvtqqvtqqvtqqvtqqvtqqvtqq|qqxxqqxxqqxxqqxxqqxxqqxxqqxxqq|qqssqqssqqssqqssqqssqqssqqssqq)\d+$",
     re.IGNORECASE,
 )
 
