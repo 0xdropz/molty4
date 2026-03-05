@@ -229,10 +229,8 @@ class GodModeIntel:
                     or 1
                 )
                 total += int(qty or 0)
-        # Also check agent-level rewards field if present
-        rewards = agent.get("rewards", 0)
-        if isinstance(rewards, (int, float)) and rewards > 0:
-            total += int(rewards)
+        # NOTE: agent.rewards field is a server-side mirror of inventory Moltz qty.
+        # Adding it would double-count. Inventory scan above is the single source of truth.
         return total
 
     def find_nearest_enemy(
