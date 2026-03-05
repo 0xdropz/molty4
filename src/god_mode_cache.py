@@ -114,99 +114,192 @@ class GodModeCache:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0",
         }
 
-        fail_count = 0
+        # WS close codes that mean "game is gone — stop immediately, no reconnect"
+        # Bug #2 fix: detect 4004 specifically and stop instead of reconnecting
+        _FATAL_WS_CODES = {
+            4004,  # Game not found
+            4003,  # Forbidden / not authorised
+            4001,  # Unauthorised
+            1008,  # Policy violation
+        }
 
-        while self._running:
-            try:
-                # Fetch WS endpoint URL
-                resp = await api_client.get_ws_endpoint(game_id)
+        endpoint_fail_count = 0  # HTTP /ws-endpoint failures
+        ws_fail_count = 0  # WS-level non-fatal failures
 
-                if not resp or not resp.get("success"):
-                    fail_count += 1
-                    err = resp.get("error", {}) if resp else {}
-                    _log(
-                        game_id,
-                        f"Endpoint FAILED [{fail_count}/10]: {err.get('code', '?')} — {err.get('message', 'no response')}",
-                    )
-                    if fail_count > 10:
-                        _log(game_id, "Too many failures. Giving up.")
-                        break
-                    await asyncio.sleep(5)
-                    continue
-
-                fail_count = 0
-                data_obj = resp.get("data", {})
-                ws_url = (
-                    data_obj.get("wsUrl")
-                    or data_obj.get("url")
-                    or data_obj.get("wsEndpoint")
-                    or data_obj.get("endpoint")
-                )
-                if not ws_url:
-                    _log(
-                        game_id,
-                        f"No URL in endpoint response. Keys: {list(data_obj.keys())}",
-                    )
-                    fail_count += 1
-                    await asyncio.sleep(5)
-                    continue
-
-                # Connect WebSocket (spoofed as browser)
-                async with websockets.connect(
-                    ws_url,
-                    extra_headers=headers,
-                    max_size=10 * 1024 * 1024,
-                    ping_interval=30,
-                    ping_timeout=15,
-                ) as ws:
-                    msg_count = 0
-
-                    while self._running:
-                        msg = await ws.recv()
-                        msg_count += 1
+        try:
+            while self._running:
+                try:
+                    # ── Bug #3 fix: check game status via HTTP before (re)connecting ──
+                    # Only after a failure — skip first iteration
+                    if endpoint_fail_count > 0 or ws_fail_count > 0:
                         try:
-                            data = json.loads(msg)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if "state" in data:
-                            state_data = data["state"]
-                            self.game_states[game_id] = state_data
-
-                            # Build agent index (live pointers into state_data["agents"])
-                            self._build_agent_index(game_id)
-
-                            # Log only on first state received per connection
-                            if msg_count == 1:
-                                agents = len(state_data.get("agents", []))
-                                regions = len(state_data.get("regions", []))
+                            info = await api_client.get_game_info(game_id)
+                            data_info = info.get("data", info) if info else {}
+                            status = data_info.get("status", "")
+                            err_code = (
+                                (info.get("error", {}) or {}).get("code", "")
+                                if info
+                                else ""
+                            )
+                            if status == "finished" or err_code == "GAME_NOT_FOUND":
                                 _log(
                                     game_id,
-                                    f"CONNECTED — agents={agents} regions={regions} size={len(msg)}B",
+                                    f"Game is '{status or err_code}' — stopping listener.",
                                 )
-
-                            # Stop when game finishes
-                            if state_data.get("room", {}).get("status") == "finished":
-                                _log(game_id, "Game finished — stopping listener.")
                                 return
+                        except Exception:
+                            pass  # If HTTP check fails, attempt WS anyway
 
-                        else:
-                            # Event message — apply delta to cached state
-                            self._apply_event(game_id, data)
+                    # Fetch WS endpoint URL
+                    resp = await api_client.get_ws_endpoint(game_id)
 
-            except asyncio.CancelledError:
-                break
-            except websockets.exceptions.ConnectionClosed as e:
-                _log(game_id, f"Connection closed: {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
-            except Exception as e:
-                _log(game_id, f"Error ({type(e).__name__}): {e}. Reconnecting in 5s...")
-                await asyncio.sleep(5)
+                    if not resp or not resp.get("success"):
+                        endpoint_fail_count += 1
+                        err = resp.get("error", {}) if resp else {}
+                        err_code = err.get("code", "?")
+                        # GAME_NOT_FOUND from HTTP endpoint → stop immediately
+                        if err_code in ("GAME_NOT_FOUND", "GAME_FINISHED"):
+                            _log(
+                                game_id,
+                                f"Endpoint says game gone ({err_code}) — stopping.",
+                            )
+                            return
+                        _log(
+                            game_id,
+                            f"Endpoint FAILED [{endpoint_fail_count}/10]: {err_code} — {err.get('message', 'no response')}",
+                        )
+                        if endpoint_fail_count > 10:
+                            _log(game_id, "Too many endpoint failures. Giving up.")
+                            return
+                        await asyncio.sleep(5)
+                        continue
 
-        # Cleanup on exit
-        self.ws_tasks.pop(game_id, None)
-        self.game_states.pop(game_id, None)
-        self._agent_index.pop(game_id, None)
+                    endpoint_fail_count = 0
+                    data_obj = resp.get("data", {})
+                    ws_url = (
+                        data_obj.get("wsUrl")
+                        or data_obj.get("url")
+                        or data_obj.get("wsEndpoint")
+                        or data_obj.get("endpoint")
+                    )
+                    if not ws_url:
+                        _log(
+                            game_id,
+                            f"No URL in endpoint response. Keys: {list(data_obj.keys())}",
+                        )
+                        endpoint_fail_count += 1
+                        await asyncio.sleep(5)
+                        continue
+
+                    # Connect WebSocket (spoofed as browser)
+                    async with websockets.connect(
+                        ws_url,
+                        extra_headers=headers,
+                        max_size=10 * 1024 * 1024,
+                        ping_interval=30,
+                        ping_timeout=15,
+                    ) as ws:
+                        # Reset WS fail counter on successful connection
+                        ws_fail_count = 0
+                        msg_count = 0
+
+                        while self._running:
+                            msg = await ws.recv()
+                            msg_count += 1
+                            try:
+                                data = json.loads(msg)
+                            except json.JSONDecodeError:
+                                continue
+
+                            if "state" in data:
+                                state_data = data["state"]
+                                self.game_states[game_id] = state_data
+
+                                # Build agent index (live pointers into state_data["agents"])
+                                self._build_agent_index(game_id)
+
+                                # Log only on first state received per connection
+                                if msg_count == 1:
+                                    agents = len(state_data.get("agents", []))
+                                    regions = len(state_data.get("regions", []))
+                                    _log(
+                                        game_id,
+                                        f"CONNECTED — agents={agents} regions={regions} size={len(msg)}B",
+                                    )
+
+                                # Stop when game finishes
+                                room_status = (
+                                    state_data.get("room", {}).get("status")
+                                    or state_data.get("gameStatus")
+                                    or state_data.get("status", "")
+                                )
+                                if room_status == "finished":
+                                    _log(game_id, "Game finished — stopping listener.")
+                                    return
+
+                            else:
+                                # Event message — apply delta to cached state
+                                self._apply_event(game_id, data)
+
+                except asyncio.CancelledError:
+                    raise  # propagate to outer try/finally
+
+                except websockets.exceptions.ConnectionClosedError as e:
+                    # Bug #2 fix: fatal WS close codes → stop immediately, no reconnect
+                    if e.code in _FATAL_WS_CODES:
+                        _log(
+                            game_id,
+                            f"WS rejected (code {e.code}: {e.reason!r}) — game gone. Stopping.",
+                        )
+                        return
+                    # Bug #1 fix: cap non-fatal WS failures
+                    ws_fail_count += 1
+                    _log(
+                        game_id,
+                        f"WS closed [{ws_fail_count}/5]: code={e.code} reason={e.reason!r}. Reconnecting in 5s...",
+                    )
+                    if ws_fail_count >= 5:
+                        _log(game_id, "Too many WS failures. Stopping listener.")
+                        return
+                    await asyncio.sleep(5)
+
+                except websockets.exceptions.ConnectionClosed as e:
+                    if e.code in _FATAL_WS_CODES:
+                        _log(
+                            game_id,
+                            f"WS closed (code {e.code}: {e.reason!r}) — game gone. Stopping.",
+                        )
+                        return
+                    ws_fail_count += 1
+                    _log(
+                        game_id,
+                        f"WS closed [{ws_fail_count}/5]: code={e.code}. Reconnecting in 5s...",
+                    )
+                    if ws_fail_count >= 5:
+                        _log(game_id, "Too many WS closures. Stopping listener.")
+                        return
+                    await asyncio.sleep(5)
+
+                except Exception as e:
+                    ws_fail_count += 1
+                    _log(
+                        game_id,
+                        f"Error [{ws_fail_count}/5] ({type(e).__name__}): {e}. Reconnecting in 5s...",
+                    )
+                    if ws_fail_count >= 5:
+                        _log(game_id, "Too many errors. Stopping listener.")
+                        return
+                    await asyncio.sleep(5)
+
+        except asyncio.CancelledError:
+            pass
+
+        finally:
+            # Cleanup always runs — whether stopped by return, CancelledError, or exception
+            self.ws_tasks.pop(game_id, None)
+            self.game_states.pop(game_id, None)
+            self._agent_index.pop(game_id, None)
+            _log(game_id, "Listener stopped and cleaned up.")
 
     def get_state(self, game_id: str) -> dict | None:
         """Mengambil state terbaru dari cache."""
