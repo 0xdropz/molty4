@@ -168,7 +168,10 @@ def decide_action(
     P8  — Supply cache in region + EP >= 1: interact
     P9  — Medical facility in region + HP < 100: interact
     P10 — Moltz on ground in other region + EP >= 1: move toward
-    P11 — Safest Region Fallback: Move to safe center
+    P11 — God Mode available:
+              P11a dist>4 dari safe center → approach safe center
+              P11b dalam zona + ada musuh dist<=4 → zone hunt (move toward)
+              P11c dalam zona + tidak ada musuh → rest (tunggu musuh masuk zona)
     P12 — Move to best terrain neighbor (if no god mode)
     P13 — Rest if EP = 0
     P14 — None (fallback)
@@ -430,16 +433,45 @@ def decide_action(
                 move["_reason"] = f"MOLTZ GRAB (dist:{moltz_target['dist']})"
                 return move
 
-    # ── P11: SAFEST REGION FALLBACK ─────────────────────────────────────────
+    # ── P11: ZONING (God Mode) ───────────────────────────────────────────────
     if state.ep >= 1 and intel and intel.available:
         safe_center_id = intel.find_safest_region(pending_dz_ids=pending_ids)
-        if safe_center_id and safe_center_id != state.region_id:
-            move = move_toward_target(state, safe_center_id, intel, pending_ids)
-            if move:
-                move["_reason"] = (
-                    f"roam → Safe Center ({intel.get_region_name(safe_center_id)})"
+
+        if safe_center_id:
+            dist_to_center = intel.calculate_distance(
+                state.region_id, safe_center_id, max_dist=20
+            )
+
+            # P11a — belum dalam zona (> 4 hop dari safe center) → mendekati safe center
+            if dist_to_center > 4:
+                move = move_toward_target(state, safe_center_id, intel, pending_ids)
+                if move:
+                    move["_reason"] = (
+                        f"approach zone → {intel.get_region_name(safe_center_id)} "
+                        f"(dist:{dist_to_center})"
+                    )
+                    return move
+
+            # P11b — sudah dalam zona → cari musuh terdekat dalam radius 4 hop
+            nearest = intel.find_nearest_enemy(
+                current_id=state.region_id,
+                max_dist=4,
+                pending_dz_ids=pending_ids,
+                my_bot_ids=my_bot_ids,
+            )
+            if nearest:
+                move = move_toward_target(
+                    state, nearest["region_id"], intel, pending_ids
                 )
-                return move
+                if move:
+                    move["_reason"] = (
+                        f"ZONE HUNT: {nearest['name']} "
+                        f"(dist:{nearest['dist']} HP:{nearest['hp']:.0f})"
+                    )
+                    return move
+
+            # P11c — dalam zona, tidak ada musuh → rest (hemat EP, tunggu musuh masuk)
+            return get_rest_action()
 
     # ── P12: MOVE TO BEST TERRAIN NEIGHBOR (No God Mode Fallback) ───────────
     if state.ep >= 1:

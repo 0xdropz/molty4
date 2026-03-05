@@ -235,6 +235,81 @@ class GodModeIntel:
             total += int(rewards)
         return total
 
+    def find_nearest_enemy(
+        self,
+        current_id: str,
+        max_dist: int = 4,
+        pending_dz_ids: set = None,
+        my_bot_ids: set = None,
+    ) -> dict | None:
+        """Find the nearest non-friendly alive agent within max_dist hops.
+
+        Used for zoning: when bot is already in safe zone and wants to engage
+        the closest threat rather than patrolling blindly.
+
+        Returns dict with id, name, region_id, dist, hp, kills — or None.
+        """
+        if not self.available:
+            return None
+
+        pending = pending_dz_ids or set()
+        friendly = my_bot_ids or set()
+
+        # Build danger set to avoid routing through DZ
+        danger_set = set()
+        for r in self.all_regions:
+            if r.get("isDeathZone", False) or r["id"] in pending:
+                danger_set.add(r["id"])
+
+        # BFS from current position up to max_dist hops
+        graph = self._build_graph()
+        queue = deque([(current_id, 0)])
+        visited = {current_id}
+        reachable = {}  # region_id → dist
+
+        while queue:
+            curr, dist = queue.popleft()
+            if dist > 0:
+                reachable[curr] = dist
+            if dist >= max_dist:
+                continue
+            for nb in graph.get(curr, []):
+                if nb not in visited and nb not in danger_set:
+                    visited.add(nb)
+                    queue.append((nb, dist + 1))
+
+        if not reachable:
+            return None
+
+        # Find closest non-friendly alive agent in reachable regions
+        best = None
+        best_dist = 999
+
+        for a in self.all_agents:
+            if not a.get("isAlive", False):
+                continue
+            name = a.get("name", "")
+            if IS_FRIENDLY_REGEX.match(name):
+                continue
+            if name in friendly:
+                continue
+            rid = a.get("regionId", "")
+            if rid not in reachable:
+                continue
+            dist = reachable[rid]
+            if dist < best_dist:
+                best_dist = dist
+                best = {
+                    "id": a["id"],
+                    "name": name,
+                    "region_id": rid,
+                    "dist": dist,
+                    "hp": a.get("hp", 0),
+                    "kills": a.get("kills", 0),
+                }
+
+        return best
+
     def find_sultan(self, threshold: int = 30) -> dict | None:
         """Find the non-friendly agent with the most Moltz."""
         if not self.available:
